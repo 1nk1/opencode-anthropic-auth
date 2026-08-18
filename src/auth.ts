@@ -143,3 +143,85 @@ export async function exchange(
 
   return exchangeCode(callback, verifier, redirectUri)
 }
+
+export type RefreshResult =
+  | { type: 'success'; refresh: string; access: string; expires: number }
+  | { type: 'failed'; status: number; body: string }
+
+/**
+ * Exchange a refresh token for a new access/refresh token pair.
+ * Retries transient (5xx, network) failures with exponential backoff;
+ * non-transient failures (e.g. 403 on a revoked/rotated-away token)
+ * are returned immediately as `{ type: 'failed' }`.
+ */
+export async function refreshToken(
+  refreshTokenValue: string,
+): Promise<RefreshResult> {
+  const maxRetries = 2
+  const baseDelayMs = 500
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = baseDelayMs * 2 ** (attempt - 1)
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+
+      const response = await fetch(TOKEN_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+          'User-Agent': 'axios/1.13.6',
+        },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: refreshTokenValue,
+          client_id: CLIENT_ID,
+        }),
+      })
+
+      if (!response.ok) {
+        if (response.status >= 500 && attempt < maxRetries) {
+          await response.body?.cancel()
+          continue
+        }
+
+        const body = await response.text().catch(() => '')
+        return { type: 'failed', status: response.status, body }
+      }
+
+      const json = (await response.json()) as {
+        refresh_token: string
+        access_token: string
+        expires_in: number
+      }
+
+      return {
+        type: 'success',
+        refresh: json.refresh_token,
+        access: json.access_token,
+        expires: Date.now() + json.expires_in * 1000,
+      }
+    } catch (error) {
+      const isNetworkError =
+        error instanceof Error &&
+        (error.message.includes('fetch failed') ||
+          ('code' in error &&
+            (error.code === 'ECONNRESET' ||
+              error.code === 'ECONNREFUSED' ||
+              error.code === 'ETIMEDOUT' ||
+              error.code === 'UND_ERR_CONNECT_TIMEOUT')))
+
+      if (attempt < maxRetries && isNetworkError) {
+        continue
+      }
+
+      throw error
+    }
+  }
+
+  // Unreachable — each iteration either returns or throws.
+  // Kept as a TypeScript exhaustiveness guard.
+  throw new Error('Token refresh exhausted all retries')
+}

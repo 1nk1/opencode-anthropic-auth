@@ -12,13 +12,22 @@
 
 An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
 
+## Version compatibility
+
+| Plugin version | OpenCode version | Package                                     |
+|-----------------|-------------------|---------------------------------------------|
+| 2.x (this readme) | OpenCode v2 (beta plugin API) | `@ex-machina/opencode-anthropic-auth` |
+| 1.x               | OpenCode v1       | `@ex-machina/opencode-anthropic-auth@1` |
+
+OpenCode v2's plugin API is still beta, and this plugin currently targets the `@opencode-ai/plugin@0.0.0-next-17444` prerelease of it — pin the plugin version and keep an eye on the changelog when bumping either side. If you're still on OpenCode v1, keep using a `1.x` release; v1 plugins are **not** loadable by OpenCode v2, and this v2 port is not loadable by OpenCode v1.
+
 ## Usage
 
 Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth"]
+  "plugins": ["@ex-machina/opencode-anthropic-auth"]
 }
 ```
 
@@ -31,18 +40,18 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth@1.8.0"]
+  "plugins": ["@ex-machina/opencode-anthropic-auth@2.0.0"]
 }
 ```
 
 ## Authentication Methods
 
-The plugin provides three authentication options:
-
 - **Claude Pro/Max** - OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
-    - run the `/connect` command, select `Anthropic (API key)` -> `Claude Pro/Max` and do OAuth
-- **Create an API Key** - OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
-- **Manually enter API Key** - Standard API key entry for users who already have one.
+    - run the `/connect` command, select `Anthropic` -> `Claude Pro/Max` and do OAuth
+- **Manually enter API Key / `ANTHROPIC_API_KEY`** - Handled by OpenCode's built-in Anthropic integration, not by this plugin.
+
+> [!NOTE]
+> The v1 release of this plugin also offered a "Create an API Key" OAuth flow (via `console.anthropic.com`) that minted and stored an API key for you. OpenCode v2's plugin API does not yet support an OAuth authorization flow that ends in a stored API key, so that flow isn't available in this v2 release. Use manual API key entry (or `ANTHROPIC_API_KEY`) in the meantime — see [issue #203](https://github.com/ex-machina-co/opencode-anthropic-auth/issues/203) for status.
 
 ## Configuration
 
@@ -51,7 +60,7 @@ The plugin supports the following environment variables:
 | Variable                          | Description                                                                                                                                                                                 |
 |-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
-| `ANTHROPIC_INSECURE`              | Set to `1` or `true` to skip TLS certificate verification. Only effective when `ANTHROPIC_BASE_URL` is also set.                                                                            |
+| `ANTHROPIC_INSECURE`              | **Not supported under OpenCode v2.** OpenCode v2 plugin request hooks can rewrite a request but cannot disable TLS verification for it. If this is set, the plugin logs a warning and leaves TLS verification enabled — requests to a self-signed/untrusted `ANTHROPIC_BASE_URL` will fail. |
 
 ## How It Works
 
@@ -90,7 +99,14 @@ This does three things:
 2. Symlinks the build output into `.opencode/plugins/` so OpenCode loads it as a local plugin
 3. Starts `tsc --watch` for automatic rebuilds on source changes
 
-After starting the dev script, restart OpenCode in this project directory to pick up the local build. Any edits to `src/` will trigger a rebuild — restart OpenCode again to load the new version.
+After starting the dev script, restart OpenCode v2 (`opencode2`) in this project directory to pick up the local build. Any edits to `src/` will trigger a rebuild — restart OpenCode again to load the new version.
+
+You can confirm the plugin loaded correctly via the OpenCode v2 API:
+
+```bash
+opencode2 api get /api/plugin        # should list "ex-machina.anthropic-auth"
+opencode2 api get /api/integration   # anthropic should offer a "Claude Pro/Max" OAuth method
+```
 
 Ctrl+C stops the watcher and cleans up the symlink. If the process was killed without cleanup (e.g. `kill -9`), you can manually remove the symlink:
 
