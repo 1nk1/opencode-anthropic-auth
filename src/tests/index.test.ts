@@ -246,6 +246,43 @@ describe('integration registration', () => {
     }
   })
 
+  test('reuses a successful refresh for delayed calls with the rotated token', async () => {
+    const { ctx, integrationMethods } = createMockContext()
+
+    let tokenRequests = 0
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock(() => {
+      tokenRequests++
+      return Promise.resolve(
+        Response.json({
+          refresh_token: 'new-refresh',
+          access_token: 'new-access',
+          expires_in: 3600,
+        }),
+      )
+    }) as unknown as typeof fetch
+
+    try {
+      await plugin.setup(ctx as any)
+      const registration = integrationMethods[0] as any
+      const credential = {
+        type: 'oauth' as const,
+        methodID: 'claude-max',
+        refresh: 'old-refresh',
+        access: 'old-access',
+        expires: Date.now() - 1000,
+      }
+
+      const first = await registration.refresh(credential)
+      const delayed = await registration.refresh(credential)
+
+      expect(tokenRequests).toBe(1)
+      expect(delayed).toEqual(first)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test('concurrent refreshes keep different credentials isolated', async () => {
     const { ctx, integrationMethods } = createMockContext()
     const refreshTokens: string[] = []
@@ -454,6 +491,46 @@ describe('session http.response hook', () => {
     const text = await event.response.text()
     expect(text).toContain('"name": "bash"')
     expect(text).not.toContain('mcp_bash')
+  })
+
+  test('strips tool prefixes after another hook clones the OAuth request', async () => {
+    const { ctx, sessionHooks } = createMockContext()
+    ;(ctx.integration.connection.active as any).mockImplementation(
+      async () => ({
+        id: 'conn-1',
+      }),
+    )
+    ;(ctx.integration.connection.resolve as any).mockImplementation(
+      async () => ({
+        type: 'oauth',
+        methodID: 'claude-max',
+        refresh: 'r',
+        access: 'a',
+        expires: Date.now() + 100000,
+      }),
+    )
+    await plugin.setup(ctx as any)
+
+    const requestEvent: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: new Request('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: '{}',
+      }),
+    }
+    await sessionHooks.get('http.request')!(requestEvent)
+
+    const clonedRequest = new Request(requestEvent.request)
+    const responseEvent: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: clonedRequest,
+      response: new Response(
+        'data: {"content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
+      ),
+    }
+    await sessionHooks.get('http.response')!(responseEvent)
+
+    expect(await responseEvent.response.text()).toContain('"name": "bash"')
   })
 
   test('leaves non-anthropic responses untouched', async () => {

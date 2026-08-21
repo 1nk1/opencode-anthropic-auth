@@ -1,5 +1,6 @@
 import { type Credential, Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange, refreshToken } from './auth.ts'
+import { REQUIRED_BETAS } from './constants.ts'
 import {
   createStrippedStream,
   isInsecure,
@@ -55,13 +56,26 @@ function warnIfInsecureUnsupported() {
   )
 }
 
+function isTransformedOAuthRequest(request: Request): boolean {
+  const betas = new Set(
+    (request.headers.get('anthropic-beta') ?? '')
+      .split(',')
+      .map((beta) => beta.trim()),
+  )
+  return (
+    request.headers.get('authorization')?.startsWith('Bearer ') === true &&
+    REQUIRED_BETAS.every((beta) => betas.has(beta)) &&
+    new URL(request.url).searchParams.get('beta') === 'true'
+  )
+}
+
 export default Plugin.define({
   id: PLUGIN_ID,
   setup: async (ctx) => {
     warnIfInsecureUnsupported()
 
-    // Keep refresh deduplication scoped to this plugin generation so a reload
-    // cannot share stale credentials with the replacement instance.
+    // Retain successful refreshes for this plugin generation so a host call
+    // holding the rotated token cannot submit it again before persistence.
     const refreshInFlight = new Map<string, Promise<Credential.OAuth>>()
     const refreshCredential = async (credential: Credential.OAuth) => {
       const existing = refreshInFlight.get(credential.refresh)
@@ -77,10 +91,11 @@ export default Plugin.define({
       refreshInFlight.set(credential.refresh, pending)
       try {
         return await pending
-      } finally {
+      } catch (error) {
         if (refreshInFlight.get(credential.refresh) === pending) {
           refreshInFlight.delete(credential.refresh)
         }
+        throw error
       }
     }
 
@@ -119,8 +134,6 @@ export default Plugin.define({
       })
     })
 
-    const transformedRequests = new WeakSet<Request>()
-
     await ctx.session.hook('http.request', async (event) => {
       if (event.model.providerID !== INTEGRATION_ID) return
       const credential = await resolveActiveOAuth(ctx)
@@ -149,12 +162,11 @@ export default Plugin.define({
         body: rewrittenBody,
         signal: request.signal,
       })
-      transformedRequests.add(event.request)
     })
 
     await ctx.session.hook('http.response', (event) => {
       if (event.model.providerID !== INTEGRATION_ID) return
-      if (!transformedRequests.delete(event.request)) return
+      if (!isTransformedOAuthRequest(event.request)) return
       event.response = createStrippedStream(event.response)
     })
   },
