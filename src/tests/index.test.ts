@@ -1,20 +1,13 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
 import plugin from '../index'
 
 /**
  * Minimal mock of the OpenCode v2 promise plugin `Context`, covering only
- * the surface this plugin actually uses: `integration`, `catalog`,
- * `session`, and `event`.
+ * the `integration` and `session` surfaces this plugin uses.
  */
 function createMockContext() {
   const integrationMethods: Array<Record<string, unknown>> = []
   const sessionHooks = new Map<string, (event: any) => Promise<void> | void>()
-  let catalogTransformCb: ((draft: any) => void) | undefined
-
-  const eventQueue: any[] = []
-  let notifyEvent: (() => void) | null = null
-  let subscribeAbortSignal: AbortSignal | undefined
-
   const ctx = {
     integration: {
       transform: mock(async (cb: (draft: any) => void) => {
@@ -37,13 +30,6 @@ function createMockContext() {
         ),
       },
     },
-    catalog: {
-      transform: mock(async (cb: (draft: any) => void) => {
-        catalogTransformCb = cb
-        return { dispose: mock(async () => {}) }
-      }),
-      reload: mock(async () => {}),
-    },
     session: {
       hook: mock(
         async (name: string, cb: (event: any) => Promise<void> | void) => {
@@ -52,69 +38,12 @@ function createMockContext() {
         },
       ),
     },
-    event: {
-      subscribe: mock((opts?: { signal?: AbortSignal }) => {
-        subscribeAbortSignal = opts?.signal
-        return {
-          [Symbol.asyncIterator]() {
-            return {
-              async next() {
-                while (eventQueue.length === 0) {
-                  if (subscribeAbortSignal?.aborted) {
-                    return { done: true, value: undefined }
-                  }
-                  await new Promise<void>((resolve) => {
-                    notifyEvent = resolve
-                    subscribeAbortSignal?.addEventListener(
-                      'abort',
-                      () => resolve(),
-                      { once: true },
-                    )
-                  })
-                }
-                return { done: false, value: eventQueue.shift() }
-              },
-            }
-          },
-        }
-      }),
-    },
   }
 
   return {
     ctx,
     integrationMethods,
     sessionHooks,
-    getCatalogTransform: () => catalogTransformCb,
-    pushEvent(event: unknown) {
-      eventQueue.push(event)
-      notifyEvent?.()
-      notifyEvent = null
-    },
-  }
-}
-
-function createCatalogDraft(models: Record<string, { cost: unknown }>) {
-  const modelsMap = new Map(Object.entries(models))
-  return {
-    provider: {
-      get: mock((id: string) =>
-        id === 'anthropic' ? { provider: {}, models: modelsMap } : undefined,
-      ),
-    },
-    model: {
-      update: mock(
-        (
-          _providerID: string,
-          modelID: string,
-          updater: (model: { cost: unknown }) => void,
-        ) => {
-          const model = modelsMap.get(modelID)
-          if (model) updater(model)
-        },
-      ),
-    },
-    modelsMap,
   }
 }
 
@@ -316,47 +245,46 @@ describe('integration registration', () => {
       globalThis.fetch = originalFetch
     }
   })
-})
 
-describe('catalog cost transform', () => {
-  test('zeros Anthropic model costs when OAuth is active', async () => {
-    const { ctx, getCatalogTransform } = createMockContext()
-    ;(ctx.integration.connection.active as any).mockImplementation(
-      async () => ({
-        id: 'conn-1',
-      }),
-    )
-    ;(ctx.integration.connection.resolve as any).mockImplementation(
-      async () => ({
-        type: 'oauth',
+  test('concurrent refreshes keep different credentials isolated', async () => {
+    const { ctx, integrationMethods } = createMockContext()
+    const refreshTokens: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock((_input: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      const refreshToken = String(body.refresh_token)
+      refreshTokens.push(refreshToken)
+      return Promise.resolve(
+        Response.json({
+          refresh_token: `new-${refreshToken}`,
+          access_token: `access-${refreshToken}`,
+          expires_in: 3600,
+        }),
+      )
+    }) as unknown as typeof fetch
+
+    try {
+      await plugin.setup(ctx as any)
+      const registration = integrationMethods[0] as any
+      const credential = (refresh: string) => ({
+        type: 'oauth' as const,
         methodID: 'claude-max',
-        refresh: 'r',
-        access: 'a',
-        expires: Date.now() + 100000,
-      }),
-    )
+        refresh,
+        access: 'old-access',
+        expires: Date.now() - 1000,
+      })
 
-    await plugin.setup(ctx as any)
-    const draft = createCatalogDraft({
-      'claude-3': { cost: [{ input: 3, output: 15 }] },
-    })
-    getCatalogTransform()!(draft)
+      const [first, second] = await Promise.all([
+        registration.refresh(credential('first')),
+        registration.refresh(credential('second')),
+      ])
 
-    expect(draft.modelsMap.get('claude-3')!.cost).toEqual([])
-  })
-
-  test('leaves Anthropic model costs untouched when OAuth is not active', async () => {
-    const { ctx, getCatalogTransform } = createMockContext()
-    await plugin.setup(ctx as any)
-
-    const draft = createCatalogDraft({
-      'claude-3': { cost: [{ input: 3, output: 15 }] },
-    })
-    getCatalogTransform()!(draft)
-
-    expect(draft.modelsMap.get('claude-3')!.cost).toEqual([
-      { input: 3, output: 15 },
-    ])
+      expect(refreshTokens).toEqual(['first', 'second'])
+      expect(first.access).toBe('access-first')
+      expect(second.access).toBe('access-second')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 })
 
@@ -476,12 +404,11 @@ describe('session http.request hook', () => {
 })
 
 describe('session http.response hook', () => {
-  test('strips the tool prefix from streaming responses for an active OAuth connection', async () => {
+  test('strips tool prefixes when the matching request used OAuth', async () => {
     const { ctx, sessionHooks } = createMockContext()
-    ;(ctx.integration.connection.active as any).mockImplementation(
-      async () => ({
-        id: 'conn-1',
-      }),
+    let oauthActive = true
+    ;(ctx.integration.connection.active as any).mockImplementation(async () =>
+      oauthActive ? { id: 'conn-1' } : undefined,
     )
     ;(ctx.integration.connection.resolve as any).mockImplementation(
       async () => ({
@@ -493,6 +420,16 @@ describe('session http.response hook', () => {
       }),
     )
     await plugin.setup(ctx as any)
+
+    const requestEvent: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: new Request('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: '{}',
+      }),
+    }
+    await sessionHooks.get('http.request')!(requestEvent)
+    oauthActive = false
 
     const encoder = new TextEncoder()
     const stream = new ReadableStream({
@@ -508,7 +445,7 @@ describe('session http.response hook', () => {
     const originalResponse = new Response(stream, { status: 200 })
     const event: any = {
       model: { providerID: 'anthropic', modelID: 'claude-3' },
-      request: new Request('https://api.anthropic.com/v1/messages'),
+      request: requestEvent.request,
       response: originalResponse,
     }
     await sessionHooks.get('http.response')!(event)
@@ -533,72 +470,19 @@ describe('session http.response hook', () => {
 
     expect(event.response).toBe(originalResponse)
   })
-})
 
-describe('integration.connection.updated event handling', () => {
-  let originalConsoleWarn: typeof console.warn
-
-  beforeEach(() => {
-    originalConsoleWarn = console.warn
-    console.warn = mock(() => {})
-  })
-
-  afterEach(() => {
-    console.warn = originalConsoleWarn
-  })
-
-  test('reloads the catalog when the anthropic connection changes activation state', async () => {
-    const { ctx, pushEvent } = createMockContext()
-    let active = false
-    ;(ctx.integration.connection.active as any).mockImplementation(async () =>
-      active ? { id: 'conn-1' } : undefined,
-    )
-    ;(ctx.integration.connection.resolve as any).mockImplementation(
-      async () => ({
-        type: 'oauth',
-        methodID: 'claude-max',
-        refresh: 'r',
-        access: 'a',
-        expires: Date.now() + 100000,
-      }),
-    )
-
-    await plugin.setup(ctx as any)
-    expect(ctx.catalog.reload).not.toHaveBeenCalled()
-
-    active = true
-    pushEvent({
-      type: 'integration.connection.updated',
-      data: { integrationID: 'anthropic' },
-    })
-
-    await Bun.sleep(0)
-    await Bun.sleep(0)
-
-    expect(ctx.catalog.reload).toHaveBeenCalledTimes(1)
-  })
-
-  test('ignores connection updates for other integrations', async () => {
-    const { ctx, pushEvent } = createMockContext()
+  test('leaves Anthropic responses untouched when the request did not use OAuth', async () => {
+    const { ctx, sessionHooks } = createMockContext()
     await plugin.setup(ctx as any)
 
-    pushEvent({
-      type: 'integration.connection.updated',
-      data: { integrationID: 'openai' },
-    })
-    await Bun.sleep(0)
-    await Bun.sleep(0)
+    const originalResponse = new Response('ok')
+    const event: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: new Request('https://api.anthropic.com/v1/messages'),
+      response: originalResponse,
+    }
+    await sessionHooks.get('http.response')!(event)
 
-    expect(ctx.catalog.reload).not.toHaveBeenCalled()
-  })
-})
-
-describe('setup cleanup', () => {
-  test('cleanup aborts and waits for the event subscription', async () => {
-    const { ctx } = createMockContext()
-    const cleanup = await plugin.setup(ctx as any)
-
-    expect(cleanup).toBeFunction()
-    await (cleanup as () => Promise<void>)()
+    expect(event.response).toBe(originalResponse)
   })
 })

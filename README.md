@@ -52,6 +52,8 @@ Add the plugin to your OpenCode configuration:
 
 > [!NOTE]
 > The v1 release of this plugin also offered a "Create an API Key" OAuth flow (via `console.anthropic.com`) that minted and stored an API key for you. OpenCode v2's plugin API does not yet support an OAuth authorization flow that ends in a stored API key, so that flow isn't available in this v2 release. Use manual API key entry (or `ANTHROPIC_API_KEY`) in the meantime — see [issue #203](https://github.com/ex-machina-co/opencode-anthropic-auth/issues/203) for status.
+>
+> OpenCode v2 continues to display Anthropic's API prices for these models even though requests authenticated through Claude Pro/Max use the subscription. Dynamic cost display is deferred until the beta plugin API can safely cancel the required connection event subscription.
 
 ## Configuration
 
@@ -71,7 +73,6 @@ For Claude Pro/Max authentication, the plugin:
 3. Automatically refreshes expired tokens
 4. Injects the required OAuth headers and beta flags into API requests
 5. Sanitizes the system prompt for compatibility (see below)
-6. Zeros out model costs (since usage is covered by the subscription)
 
 ### System Prompt Sanitization
 

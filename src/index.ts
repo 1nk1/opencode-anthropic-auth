@@ -62,20 +62,26 @@ export default Plugin.define({
 
     // Keep refresh deduplication scoped to this plugin generation so a reload
     // cannot share stale credentials with the replacement instance.
-    let refreshInFlight: Promise<Credential.OAuth> | null = null
+    const refreshInFlight = new Map<string, Promise<Credential.OAuth>>()
     const refreshCredential = async (credential: Credential.OAuth) => {
-      if (!refreshInFlight) {
-        refreshInFlight = (async () => {
-          const result = await refreshToken(credential.refresh)
-          if (result.type === 'failed') {
-            throw new Error(`Anthropic token refresh failed: ${result.status}`)
-          }
-          return toCredential(result)
-        })().finally(() => {
-          refreshInFlight = null
-        })
+      const existing = refreshInFlight.get(credential.refresh)
+      if (existing) return existing
+
+      const pending = (async () => {
+        const result = await refreshToken(credential.refresh)
+        if (result.type === 'failed') {
+          throw new Error(`Anthropic token refresh failed: ${result.status}`)
+        }
+        return toCredential(result)
+      })()
+      refreshInFlight.set(credential.refresh, pending)
+      try {
+        return await pending
+      } finally {
+        if (refreshInFlight.get(credential.refresh) === pending) {
+          refreshInFlight.delete(credential.refresh)
+        }
       }
-      return refreshInFlight
     }
 
     await ctx.integration.transform((draft) => {
@@ -113,21 +119,7 @@ export default Plugin.define({
       })
     })
 
-    // Zero out Anthropic model costs while our OAuth connection is active —
-    // usage is covered by the Claude Pro/Max subscription, not billed per
-    // token. Re-evaluated whenever the active connection changes.
-    let oauthActive = Boolean(await resolveActiveOAuth(ctx))
-
-    await ctx.catalog.transform((draft) => {
-      if (!oauthActive) return
-      const provider = draft.provider.get(INTEGRATION_ID)
-      if (!provider) return
-      for (const modelID of provider.models.keys()) {
-        draft.model.update(INTEGRATION_ID, modelID, (model) => {
-          model.cost = []
-        })
-      }
-    })
+    const transformedRequests = new WeakSet<Request>()
 
     await ctx.session.hook('http.request', async (event) => {
       if (event.model.providerID !== INTEGRATION_ID) return
@@ -157,50 +149,13 @@ export default Plugin.define({
         body: rewrittenBody,
         signal: request.signal,
       })
+      transformedRequests.add(event.request)
     })
 
-    await ctx.session.hook('http.response', async (event) => {
+    await ctx.session.hook('http.response', (event) => {
       if (event.model.providerID !== INTEGRATION_ID) return
-      const credential = await resolveActiveOAuth(ctx)
-      if (!credential) return
+      if (!transformedRequests.delete(event.request)) return
       event.response = createStrippedStream(event.response)
     })
-
-    // Keep the cached OAuth-active flag (and therefore the catalog cost
-    // transform above) in sync with connection changes made outside of a
-    // request — e.g. connecting/disconnecting via `/connect`.
-    const abortController = new AbortController()
-    const eventTask = (async () => {
-      try {
-        for await (const busEvent of ctx.event.subscribe({
-          signal: abortController.signal,
-        })) {
-          if (
-            busEvent.type !== 'integration.connection.updated' ||
-            busEvent.data.integrationID !== INTEGRATION_ID
-          ) {
-            continue
-          }
-
-          const wasActive = oauthActive
-          oauthActive = Boolean(await resolveActiveOAuth(ctx))
-          if (wasActive !== oauthActive) {
-            await ctx.catalog.reload()
-          }
-        }
-      } catch (error) {
-        if (!abortController.signal.aborted) {
-          console.error(
-            '[ex-machina.anthropic-auth] Connection watcher failed:',
-            error instanceof Error ? error.message : String(error),
-          )
-        }
-      }
-    })()
-
-    return async () => {
-      abortController.abort()
-      await eventTask
-    }
   },
 })
