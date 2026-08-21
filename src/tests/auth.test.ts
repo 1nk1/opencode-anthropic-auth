@@ -224,6 +224,6 @@ describe('refreshToken', () => {
     const result = await refreshToken('old-refresh')
 
     expect(attempts).toBe(1)
-    expect(result).toEqual({ type: 'failed', status: 403, body: 'Forbidden' })
+    expect(result).toEqual({ type: 'failed', status: 403 })
   })
 })

@@ -31,30 +31,6 @@ function toCredential(exchanged: {
   }
 }
 
-// Shared in-flight refresh promise — prevents concurrent refresh calls from
-// racing each other (and causing 401 cascades when the token server rotates
-// the refresh token on every use).
-let refreshInFlight: Promise<Credential.OAuth> | null = null
-
-async function refreshCredential(
-  credential: Credential.OAuth,
-): Promise<Credential.OAuth> {
-  if (!refreshInFlight) {
-    refreshInFlight = (async () => {
-      const result = await refreshToken(credential.refresh)
-      if (result.type === 'failed') {
-        throw new Error(
-          `Anthropic token refresh failed: ${result.status} — ${result.body}`,
-        )
-      }
-      return toCredential(result)
-    })().finally(() => {
-      refreshInFlight = null
-    })
-  }
-  return refreshInFlight
-}
-
 async function resolveActiveOAuth(
   ctx: Plugin.Context,
 ): Promise<Credential.OAuth | undefined> {
@@ -83,6 +59,24 @@ export default Plugin.define({
   id: PLUGIN_ID,
   setup: async (ctx) => {
     warnIfInsecureUnsupported()
+
+    // Keep refresh deduplication scoped to this plugin generation so a reload
+    // cannot share stale credentials with the replacement instance.
+    let refreshInFlight: Promise<Credential.OAuth> | null = null
+    const refreshCredential = async (credential: Credential.OAuth) => {
+      if (!refreshInFlight) {
+        refreshInFlight = (async () => {
+          const result = await refreshToken(credential.refresh)
+          if (result.type === 'failed') {
+            throw new Error(`Anthropic token refresh failed: ${result.status}`)
+          }
+          return toCredential(result)
+        })().finally(() => {
+          refreshInFlight = null
+        })
+      }
+      return refreshInFlight
+    }
 
     await ctx.integration.transform((draft) => {
       draft.method.update({
@@ -176,7 +170,7 @@ export default Plugin.define({
     // transform above) in sync with connection changes made outside of a
     // request — e.g. connecting/disconnecting via `/connect`.
     const abortController = new AbortController()
-    ;(async () => {
+    const eventTask = (async () => {
       try {
         for await (const busEvent of ctx.event.subscribe({
           signal: abortController.signal,
@@ -195,12 +189,18 @@ export default Plugin.define({
           }
         }
       } catch (error) {
-        if (!abortController.signal.aborted) throw error
+        if (!abortController.signal.aborted) {
+          console.error(
+            '[ex-machina.anthropic-auth] Connection watcher failed:',
+            error instanceof Error ? error.message : String(error),
+          )
+        }
       }
     })()
 
-    return () => {
+    return async () => {
       abortController.abort()
+      await eventTask
     }
   },
 })

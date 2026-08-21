@@ -65,6 +65,11 @@ function createMockContext() {
                   }
                   await new Promise<void>((resolve) => {
                     notifyEvent = resolve
+                    subscribeAbortSignal?.addEventListener(
+                      'abort',
+                      () => resolve(),
+                      { once: true },
+                    )
                   })
                 }
                 return { done: false, value: eventQueue.shift() }
@@ -589,11 +594,11 @@ describe('integration.connection.updated event handling', () => {
 })
 
 describe('setup cleanup', () => {
-  test('returns a cleanup function that aborts the event subscription', async () => {
+  test('cleanup aborts and waits for the event subscription', async () => {
     const { ctx } = createMockContext()
     const cleanup = await plugin.setup(ctx as any)
 
     expect(cleanup).toBeFunction()
-    expect(() => (cleanup as () => void)()).not.toThrow()
+    await (cleanup as () => Promise<void>)()
   })
 })

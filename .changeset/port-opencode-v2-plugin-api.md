@@ -10,4 +10,4 @@ Port the plugin to the OpenCode v2 plugin API ([#203](https://github.com/ex-mach
 - Model costs are zeroed for Anthropic models only while this plugin's OAuth connection is active, via `ctx.catalog.transform` kept in sync with `ctx.event.subscribe()`.
 - The "Create an API Key" console OAuth method (which minted and stored an Anthropic API key) is not included in this release — OpenCode v2's plugin API doesn't yet support an OAuth flow that ends in a stored API key. Manual API key entry and `ANTHROPIC_API_KEY` continue to work via OpenCode's built-in Anthropic integration.
 - `ANTHROPIC_INSECURE` is not supported under OpenCode v2: request hooks can rewrite a `Request` but cannot disable TLS verification for it. The plugin now logs a warning instead of silently leaving it unapplied.
-- `@opencode-ai/plugin` is pinned to the `0.0.0-next-17444` prerelease that introduced the v2 promise plugin API used here (`peerDependencies` no longer accepts `*`).
+- `@opencode-ai/plugin` is a pinned production dependency on the `0.0.0-next-17444` prerelease that introduced the v2 promise plugin API used here.

@@ -146,7 +146,7 @@ export async function exchange(
 
 export type RefreshResult =
   | { type: 'success'; refresh: string; access: string; expires: number }
-  | { type: 'failed'; status: number; body: string }
+  | { type: 'failed'; status: number }
 
 /**
  * Exchange a refresh token for a new access/refresh token pair.
@@ -187,8 +187,8 @@ export async function refreshToken(
           continue
         }
 
-        const body = await response.text().catch(() => '')
-        return { type: 'failed', status: response.status, body }
+        await response.body?.cancel()
+        return { type: 'failed', status: response.status }
       }
 
       const json = (await response.json()) as {
