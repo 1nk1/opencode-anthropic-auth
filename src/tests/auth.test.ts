@@ -142,6 +142,36 @@ describe('exchange', () => {
     expect(result.type).toBe('failed')
     expect(fetchSpy).not.toHaveBeenCalled()
   })
+
+  test('returns failed for a malformed token response', async () => {
+    spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json({ access_token: 'access' }),
+    )
+
+    const result = await exchange(
+      'code#state',
+      'verifier',
+      CODE_CALLBACK_URL,
+      'state',
+    )
+
+    expect(result.type).toBe('failed')
+  })
+
+  test('returns failed when the token response is not JSON', async () => {
+    spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('<html>upstream error</html>', { status: 200 }),
+    )
+
+    const result = await exchange(
+      'code#state',
+      'verifier',
+      CODE_CALLBACK_URL,
+      'state',
+    )
+
+    expect(result.type).toBe('failed')
+  })
 })
 
 describe('refreshToken', () => {
@@ -225,5 +255,126 @@ describe('refreshToken', () => {
 
     expect(attempts).toBe(1)
     expect(result).toEqual({ type: 'failed', status: 403 })
+  })
+
+  test('returns failed for a malformed successful response', async () => {
+    spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json({ access_token: 'new-access' }),
+    )
+
+    const result = await refreshToken('old-refresh')
+
+    expect(result).toEqual({ type: 'failed', status: 200 })
+  })
+
+  test('returns failed when token expiry exceeds the safe timestamp range', async () => {
+    spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json({
+        refresh_token: 'new-refresh',
+        access_token: 'new-access',
+        expires_in: Number.MAX_VALUE,
+      }),
+    )
+
+    const result = await refreshToken('old-refresh')
+
+    expect(result).toEqual({ type: 'failed', status: 200 })
+  })
+
+  test('returns failed when a successful response is not JSON', async () => {
+    spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('<html>upstream error</html>', { status: 200 }),
+    )
+
+    const result = await refreshToken('old-refresh')
+
+    expect(result).toEqual({ type: 'failed', status: 200 })
+  })
+
+  test('retries a timed-out request', async () => {
+    let attempts = 0
+    const timeout = new AbortController()
+    const timeoutSpy = spyOn(AbortSignal, 'timeout').mockReturnValue(
+      timeout.signal,
+    )
+    spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => unknown,
+    ) => {
+      handler()
+      return 0
+    }) as unknown as typeof setTimeout)
+    spyOn(globalThis, 'fetch').mockImplementation(((_input, init) => {
+      attempts++
+      if (attempts === 1) {
+        expect(init?.signal).toBe(timeout.signal)
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(init.signal?.reason),
+            { once: true },
+          )
+          timeout.abort(
+            new DOMException('The operation timed out', 'TimeoutError'),
+          )
+        })
+      }
+      return Promise.resolve(
+        Response.json({
+          refresh_token: 'new-refresh',
+          access_token: 'new-access',
+          expires_in: 3600,
+        }),
+      )
+    }) as typeof fetch)
+
+    const result = await refreshToken('old-refresh')
+
+    expect(result.type).toBe('success')
+    expect(attempts).toBe(2)
+    expect(timeoutSpy).toHaveBeenCalledWith(30_000)
+  })
+
+  test('retries when token response body streaming times out', async () => {
+    let attempts = 0
+    const timeout = new AbortController()
+    spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+    spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => unknown,
+    ) => {
+      handler()
+      return 0
+    }) as unknown as typeof setTimeout)
+    spyOn(globalThis, 'fetch').mockImplementation(((_input, init) => {
+      attempts++
+      if (attempts === 1) {
+        const body = new ReadableStream({
+          start(controller) {
+            init?.signal?.addEventListener(
+              'abort',
+              () => controller.error(init.signal?.reason),
+              { once: true },
+            )
+            queueMicrotask(() =>
+              timeout.abort(
+                new DOMException('The operation timed out', 'TimeoutError'),
+              ),
+            )
+          },
+        })
+        return Promise.resolve(new Response(body, { status: 200 }))
+      }
+      return Promise.resolve(
+        Response.json({
+          refresh_token: 'new-refresh',
+          access_token: 'new-access',
+          expires_in: 3600,
+        }),
+      )
+    }) as typeof fetch)
+
+    const result = await refreshToken('old-refresh')
+
+    expect(result.type).toBe('success')
+    expect(attempts).toBe(2)
   })
 })

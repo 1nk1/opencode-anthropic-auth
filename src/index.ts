@@ -12,6 +12,7 @@ import {
 
 const PLUGIN_ID = 'ex-machina.anthropic-auth'
 const INTEGRATION_ID = 'anthropic'
+const REFRESH_CACHE_GRACE_MS = 30_000
 
 // `methodID` is a branded `Integration.MethodID` at the type level (a
 // compile-time-only tag — there's no runtime representation), so a plain
@@ -90,7 +91,14 @@ export default Plugin.define({
       })()
       refreshInFlight.set(credential.refresh, pending)
       try {
-        return await pending
+        const rotated = await pending
+        const timer = setTimeout(() => {
+          if (refreshInFlight.get(credential.refresh) === pending) {
+            refreshInFlight.delete(credential.refresh)
+          }
+        }, REFRESH_CACHE_GRACE_MS)
+        timer.unref?.()
+        return rotated
       } catch (error) {
         if (refreshInFlight.get(credential.refresh) === pending) {
           refreshInFlight.delete(credential.refresh)
@@ -147,6 +155,7 @@ export default Plugin.define({
 
       const headers = mergeHeaders(request)
       setOAuthHeaders(headers, credential.access)
+      if (rewrittenBody !== undefined) headers.delete('content-length')
 
       const { input: rewrittenInput } = rewriteUrl(request.url)
       const url =

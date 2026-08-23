@@ -12,6 +12,46 @@ type CallbackParams = {
   state: string
 }
 
+type TokenResponse = {
+  refresh_token: string
+  access_token: string
+  expires_in: number
+}
+
+const REFRESH_TIMEOUT_MS = 30_000
+
+function isTokenResponse(value: unknown): value is TokenResponse {
+  if (typeof value !== 'object' || value === null) return false
+  if (!('refresh_token' in value) || !('access_token' in value)) return false
+  if (!('expires_in' in value)) return false
+  return (
+    typeof value.refresh_token === 'string' &&
+    value.refresh_token.length > 0 &&
+    typeof value.access_token === 'string' &&
+    value.access_token.length > 0 &&
+    typeof value.expires_in === 'number' &&
+    Number.isSafeInteger(value.expires_in) &&
+    value.expires_in > 0
+  )
+}
+
+async function parseTokenResponse(response: Response) {
+  try {
+    const value: unknown = await response.json()
+    if (!isTokenResponse(value)) return undefined
+    const expires = Date.now() + value.expires_in * 1000
+    if (!Number.isSafeInteger(expires)) return undefined
+    return {
+      refresh: value.refresh_token,
+      access: value.access_token,
+      expires,
+    }
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined
+    throw error
+  }
+}
+
 export type AuthorizationResult = {
   url: string
   redirectUri: string
@@ -80,17 +120,12 @@ async function exchangeCode(
     }
   }
 
-  const json = (await result.json()) as {
-    refresh_token: string
-    access_token: string
-    expires_in: number
-  }
+  const tokens = await parseTokenResponse(result)
+  if (!tokens) return { type: 'failed' }
 
   return {
     type: 'success',
-    refresh: json.refresh_token,
-    access: json.access_token,
-    expires: Date.now() + json.expires_in * 1000,
+    ...tokens,
   }
 }
 
@@ -169,6 +204,7 @@ export async function refreshToken(
 
       const response = await fetch(TOKEN_URL, {
         method: 'POST',
+        signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json, text/plain, */*',
@@ -191,27 +227,28 @@ export async function refreshToken(
         return { type: 'failed', status: response.status }
       }
 
-      const json = (await response.json()) as {
-        refresh_token: string
-        access_token: string
-        expires_in: number
+      const tokens = await parseTokenResponse(response)
+      if (!tokens) {
+        return { type: 'failed', status: response.status }
       }
 
       return {
         type: 'success',
-        refresh: json.refresh_token,
-        access: json.access_token,
-        expires: Date.now() + json.expires_in * 1000,
+        ...tokens,
       }
     } catch (error) {
       const isNetworkError =
-        error instanceof Error &&
-        (error.message.includes('fetch failed') ||
-          ('code' in error &&
-            (error.code === 'ECONNRESET' ||
-              error.code === 'ECONNREFUSED' ||
-              error.code === 'ETIMEDOUT' ||
-              error.code === 'UND_ERR_CONNECT_TIMEOUT')))
+        (typeof error === 'object' &&
+          error !== null &&
+          'name' in error &&
+          (error.name === 'TimeoutError' || error.name === 'AbortError')) ||
+        (error instanceof Error &&
+          (error.message.includes('fetch failed') ||
+            ('code' in error &&
+              (error.code === 'ECONNRESET' ||
+                error.code === 'ECONNREFUSED' ||
+                error.code === 'ETIMEDOUT' ||
+                error.code === 'UND_ERR_CONNECT_TIMEOUT'))))
 
       if (attempt < maxRetries && isNetworkError) {
         continue

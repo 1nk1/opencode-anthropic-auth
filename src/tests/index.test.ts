@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'bun:test'
+import { describe, expect, mock, spyOn, test } from 'bun:test'
 import plugin from '../index'
 
 /**
@@ -128,9 +128,9 @@ describe('integration registration', () => {
     const registration = integrationMethods[0] as any
     const authorization = await registration.authorize({})
 
-    expect(authorization.callback('not-a-valid-callback')).rejects.toThrow(
-      /Failed to exchange/,
-    )
+    await expect(
+      authorization.callback('not-a-valid-callback'),
+    ).rejects.toThrow(/Failed to exchange/)
   })
 
   test('refresh() exchanges the refresh token for a rotated Credential.OAuth', async () => {
@@ -189,7 +189,7 @@ describe('integration registration', () => {
       await plugin.setup(ctx as any)
       const registration = integrationMethods[0] as any
 
-      expect(
+      await expect(
         registration.refresh({
           type: 'oauth',
           methodID: 'claude-max',
@@ -251,6 +251,14 @@ describe('integration registration', () => {
 
     let tokenRequests = 0
     const originalFetch = globalThis.fetch
+    let expireCachedRefresh: (() => void) | undefined
+    const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => void,
+      delay: number,
+    ) => {
+      if (delay === 30_000) expireCachedRefresh = handler
+      return { unref() {} }
+    }) as unknown as typeof setTimeout)
     globalThis.fetch = mock(() => {
       tokenRequests++
       return Promise.resolve(
@@ -278,8 +286,13 @@ describe('integration registration', () => {
 
       expect(tokenRequests).toBe(1)
       expect(delayed).toEqual(first)
+
+      expireCachedRefresh?.()
+      await registration.refresh(credential)
+      expect(tokenRequests).toBe(2)
     } finally {
       globalThis.fetch = originalFetch
+      setTimeoutSpy.mockRestore()
     }
   })
 
@@ -316,7 +329,7 @@ describe('integration registration', () => {
         registration.refresh(credential('second')),
       ])
 
-      expect(refreshTokens).toEqual(['first', 'second'])
+      expect(refreshTokens.toSorted()).toEqual(['first', 'second'])
       expect(first.access).toBe('access-first')
       expect(second.access).toBe('access-second')
     } finally {
@@ -393,7 +406,10 @@ describe('session http.request hook', () => {
       'https://api.anthropic.com/v1/messages',
       {
         method: 'POST',
-        headers: { 'x-api-key': 'my-access-token' },
+        headers: {
+          'content-length': String(body.length),
+          'x-api-key': 'my-access-token',
+        },
         body,
       },
     )
@@ -409,6 +425,7 @@ describe('session http.request hook', () => {
       'Bearer my-access-token',
     )
     expect(rewritten.headers.get('x-api-key')).toBeNull()
+    expect(rewritten.headers.get('content-length')).toBeNull()
     expect(rewritten.headers.get('anthropic-beta')).toContain(
       'oauth-2025-04-20',
     )
