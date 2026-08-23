@@ -244,6 +244,64 @@ describe('refreshToken', () => {
     expect(setTimeoutSpy).toHaveBeenCalledTimes(1)
   })
 
+  test('returns failed after exhausting transient server retries', async () => {
+    let attempts = 0
+    const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => unknown,
+    ) => {
+      handler()
+      return 0
+    }) as unknown as typeof setTimeout)
+    spyOn(globalThis, 'fetch').mockImplementation((() => {
+      attempts++
+      return Promise.resolve(new Response('Temporary failure', { status: 503 }))
+    }) as unknown as typeof fetch)
+
+    const result = await refreshToken('old-refresh')
+
+    expect(result).toEqual({ type: 'failed', status: 503 })
+    expect(attempts).toBe(3)
+    expect(setTimeoutSpy).toHaveBeenCalledTimes(2)
+  })
+
+  test('retries a connection reset', async () => {
+    let attempts = 0
+    spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => unknown,
+    ) => {
+      handler()
+      return 0
+    }) as unknown as typeof setTimeout)
+    spyOn(globalThis, 'fetch').mockImplementation((() => {
+      attempts++
+      if (attempts === 1) {
+        return Promise.reject(
+          Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }),
+        )
+      }
+      return Promise.resolve(
+        Response.json({
+          refresh_token: 'new-refresh',
+          access_token: 'new-access',
+          expires_in: 3600,
+        }),
+      )
+    }) as unknown as typeof fetch)
+
+    const result = await refreshToken('old-refresh')
+
+    expect(result.type).toBe('success')
+    expect(attempts).toBe(2)
+  })
+
+  test('does not retry non-network exceptions', async () => {
+    const failure = new Error('unexpected parser failure')
+    const fetchSpy = spyOn(globalThis, 'fetch').mockRejectedValue(failure)
+
+    await expect(refreshToken('old-refresh')).rejects.toBe(failure)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
   test('returns failed without retrying non-transient (4xx) failures', async () => {
     let attempts = 0
     spyOn(globalThis, 'fetch').mockImplementation((() => {
