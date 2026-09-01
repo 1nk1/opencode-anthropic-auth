@@ -13,3 +13,5 @@ mise.local.toml
 # mitmproxy capture files (binary, large)
 *.flow
 *.flow.log
+coverage/
+coverage/

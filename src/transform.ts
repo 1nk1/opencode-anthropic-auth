@@ -370,27 +370,37 @@ export function rewriteRequestBody(body: string): string {
 export function createStrippedStream(response: Response): Response {
   if (!response.body) return response
 
-  const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  let pending = ''
 
-  const stream = new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-        return
-      }
+  const stream = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        pending += decoder.decode(chunk, { stream: true })
 
-      let text = decoder.decode(value, { stream: true })
-      text = stripToolPrefix(text)
-      controller.enqueue(encoder.encode(text))
-    },
-  })
+        const lastNewline = pending.lastIndexOf('\n')
+        if (lastNewline < 0) return
+
+        const completeLines = pending.slice(0, lastNewline + 1)
+        pending = pending.slice(lastNewline + 1)
+        controller.enqueue(encoder.encode(stripToolPrefix(completeLines)))
+      },
+      flush(controller) {
+        pending += decoder.decode()
+        if (pending) {
+          controller.enqueue(encoder.encode(stripToolPrefix(pending)))
+        }
+      },
+    }),
+  )
+
+  const headers = new Headers(response.headers)
+  headers.delete('content-length')
 
   return new Response(stream, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers,
   })
 }
