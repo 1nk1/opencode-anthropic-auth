@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import dedent from 'dedent'
 import {
   CLAUDE_CODE_IDENTITY,
@@ -225,6 +225,10 @@ describe('stripToolPrefix', () => {
 describe('rewriteUrl', () => {
   const originalEnv = process.env.ANTHROPIC_BASE_URL
 
+  beforeEach(() => {
+    delete process.env.ANTHROPIC_BASE_URL
+  })
+
   afterEach(() => {
     if (originalEnv === undefined) {
       delete process.env.ANTHROPIC_BASE_URL
@@ -447,6 +451,59 @@ describe('createStrippedStream', () => {
 
     const stripped = createStrippedStream(original)
     expect(stripped.status).toBe(201)
+    expect(stripped.headers.get('x-custom')).toBe('value')
+  })
+
+  test('strips a tool prefix split across arbitrary stream chunks', async () => {
+    const chunks = [
+      'data: {"content_block":{"type":"tool_use","na',
+      'me":"m',
+      'cp_B',
+      'ash"}}\n\n',
+    ]
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+
+    const text = await createStrippedStream(new Response(stream)).text()
+
+    expect(text).toContain('"name": "bash"')
+    expect(text).not.toContain('mcp_')
+  })
+
+  test('preserves unicode when every input byte is a separate chunk', async () => {
+    const input =
+      'data: {"text":"Привет 👋","content_block":{"name":"mcp_Read"}}\n\n'
+    const bytes = new TextEncoder().encode(input)
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte))
+        controller.close()
+      },
+    })
+
+    const text = await createStrippedStream(new Response(stream)).text()
+
+    expect(text).toContain('Привет 👋')
+    expect(text).toContain('"name": "read"')
+    expect(text).not.toContain('�')
+  })
+
+  test('drops stale content-length after rewriting the response body', () => {
+    const original = new Response('data: {"name":"mcp_Read"}\n\n', {
+      headers: {
+        'content-length': '999',
+        'x-custom': 'value',
+      },
+    })
+
+    const stripped = createStrippedStream(original)
+
+    expect(stripped.headers.get('content-length')).toBeNull()
     expect(stripped.headers.get('x-custom')).toBe('value')
   })
 

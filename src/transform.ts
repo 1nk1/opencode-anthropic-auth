@@ -10,6 +10,9 @@ import {
   USER_AGENT,
 } from './constants.ts'
 
+// Bound an incomplete SSE line so malformed streams cannot grow memory forever.
+export const MAX_SSE_LINE_BYTES = 5 * 1024 * 1024
+
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
  * Claude Code uses PascalCase tool names (e.g. mcp_Bash, mcp_Read);
@@ -370,27 +373,79 @@ export function rewriteRequestBody(body: string): string {
 export function createStrippedStream(response: Response): Response {
   if (!response.body) return response
 
-  const reader = response.body.getReader()
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  let pending = new Uint8Array(0)
+  let pendingLength = 0
 
-  const stream = new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-        return
+  const appendPending = (bytes: Uint8Array) => {
+    const requiredLength = pendingLength + bytes.byteLength
+    if (requiredLength > MAX_SSE_LINE_BYTES) {
+      throw new Error(`SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`)
+    }
+
+    if (requiredLength > pending.byteLength) {
+      let capacity = Math.max(1024, pending.byteLength)
+      while (capacity < requiredLength) {
+        capacity = Math.min(MAX_SSE_LINE_BYTES, capacity * 2)
       }
+      const expanded = new Uint8Array(capacity)
+      expanded.set(pending.subarray(0, pendingLength))
+      pending = expanded
+    }
 
-      let text = decoder.decode(value, { stream: true })
-      text = stripToolPrefix(text)
-      controller.enqueue(encoder.encode(text))
-    },
-  })
+    pending.set(bytes, pendingLength)
+    pendingLength = requiredLength
+  }
+
+  const stream = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        let lastLineBreak = -1
+        let lineLength = pendingLength
+        for (let index = 0; index < chunk.byteLength; index++) {
+          if (chunk[index] === 0x0a || chunk[index] === 0x0d) {
+            lastLineBreak = index
+            lineLength = 0
+          } else {
+            lineLength++
+            if (lineLength > MAX_SSE_LINE_BYTES) {
+              throw new Error(
+                `SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`,
+              )
+            }
+          }
+        }
+
+        if (lastLineBreak < 0) {
+          appendPending(chunk)
+          return
+        }
+
+        const completeLines =
+          decoder.decode(pending.subarray(0, pendingLength), {
+            stream: true,
+          }) + decoder.decode(chunk.subarray(0, lastLineBreak + 1))
+
+        pendingLength = 0
+        appendPending(chunk.subarray(lastLineBreak + 1))
+        controller.enqueue(encoder.encode(stripToolPrefix(completeLines)))
+      },
+      flush(controller) {
+        const trailing = decoder.decode(pending.subarray(0, pendingLength))
+        if (trailing) {
+          controller.enqueue(encoder.encode(stripToolPrefix(trailing)))
+        }
+      },
+    }),
+  )
+
+  const headers = new Headers(response.headers)
+  headers.delete('content-length')
 
   return new Response(stream, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers,
   })
 }
