@@ -426,7 +426,10 @@ describe('createStrippedStream', () => {
       },
     })
 
-    const original = new Response(stream, { status: 200 })
+    const original = new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })
     const stripped = createStrippedStream(original)
 
     const text = await stripped.text()
@@ -446,7 +449,10 @@ describe('createStrippedStream', () => {
     const original = new Response(stream, {
       status: 201,
       statusText: 'Created',
-      headers: { 'x-custom': 'value' },
+      headers: {
+        'content-type': 'text/event-stream',
+        'x-custom': 'value',
+      },
     })
 
     const stripped = createStrippedStream(original)
@@ -469,7 +475,11 @@ describe('createStrippedStream', () => {
       },
     })
 
-    const text = await createStrippedStream(new Response(stream)).text()
+    const text = await createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    ).text()
 
     expect(text).toContain('"name": "bash"')
     expect(text).not.toContain('mcp_')
@@ -486,7 +496,11 @@ describe('createStrippedStream', () => {
       },
     })
 
-    const text = await createStrippedStream(new Response(stream)).text()
+    const text = await createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    ).text()
 
     expect(text).toContain('Привет 👋')
     expect(text).toContain('"name": "read"')
@@ -496,6 +510,7 @@ describe('createStrippedStream', () => {
   test('drops stale content-length after rewriting the response body', () => {
     const original = new Response('data: {"name":"mcp_Read"}\n\n', {
       headers: {
+        'content-type': 'text/event-stream',
         'content-length': '999',
         'x-custom': 'value',
       },

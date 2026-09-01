@@ -371,7 +371,12 @@ export function rewriteRequestBody(body: string): string {
  * Create a streaming response that strips the tool prefix from tool names.
  */
 export function createStrippedStream(response: Response): Response {
-  if (!response.body) return response
+  const mediaType = response.headers
+    .get('content-type')
+    ?.split(';', 1)[0]
+    ?.trim()
+    .toLowerCase()
+  if (!response.body || mediaType !== 'text/event-stream') return response
 
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()

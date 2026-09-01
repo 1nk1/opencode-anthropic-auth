@@ -197,6 +197,29 @@ describe('createStrippedStream - correctness guards', () => {
 })
 
 describe('createStrippedStream - transport semantics', () => {
+  test('returns an oversized non-SSE response unchanged', async () => {
+    const body = new Uint8Array(MAX_SSE_LINE_BYTES + 1).fill(0x78)
+    const original = new Response(body, {
+      status: 502,
+      headers: { 'content-type': 'application/json' },
+    })
+
+    const result = createStrippedStream(original)
+
+    expect(result).toBe(original)
+    expect((await result.arrayBuffer()).byteLength).toBe(body.byteLength)
+  })
+
+  test('accepts event-stream media type parameters case-insensitively', async () => {
+    const response = createStrippedStream(
+      sseResponse([TOOL_EVENT], {
+        'content-type': 'Text/Event-Stream; charset=utf-8',
+      }),
+    )
+
+    expect(await readText(response)).toBe(EXPECTED)
+  })
+
   test('preserves status, statusText and passthrough headers', () => {
     const response = createStrippedStream(
       new Response(streamOf([TOOL_EVENT]), {
