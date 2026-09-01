@@ -12,6 +12,23 @@ import {
 
 // Bound an incomplete SSE line so malformed streams cannot grow memory forever.
 export const MAX_SSE_LINE_BYTES = 5 * 1024 * 1024
+export const MAX_RESPONSE_JSON_BYTES = 5 * 1024 * 1024
+
+function headersAfterBodyTransform(source: Headers): Headers {
+  const headers = new Headers(source)
+  for (const name of [
+    'content-digest',
+    'content-encoding',
+    'content-length',
+    'content-md5',
+    'content-range',
+    'digest',
+    'etag',
+  ]) {
+    headers.delete(name)
+  }
+  return headers
+}
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
@@ -376,7 +393,67 @@ export function createStrippedStream(response: Response): Response {
     ?.split(';', 1)[0]
     ?.trim()
     .toLowerCase()
-  if (!response.body || mediaType !== 'text/event-stream') return response
+  if (!response.body) return response
+  if (mediaType === 'application/json' || mediaType?.endsWith('+json')) {
+    const declaredLength = Number(response.headers.get('content-length'))
+    if (
+      Number.isFinite(declaredLength) &&
+      declaredLength > MAX_RESPONSE_JSON_BYTES
+    ) {
+      return response
+    }
+
+    const decoder = new TextDecoder('utf-8', { fatal: true })
+    const encoder = new TextEncoder()
+    let chunks: Uint8Array[] = []
+    let bufferedBytes = 0
+    let passthrough = false
+    const stream = response.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          if (passthrough) {
+            controller.enqueue(chunk)
+            return
+          }
+
+          if (bufferedBytes + chunk.byteLength > MAX_RESPONSE_JSON_BYTES) {
+            for (const buffered of chunks) controller.enqueue(buffered)
+            chunks = []
+            bufferedBytes = 0
+            passthrough = true
+            controller.enqueue(chunk)
+            return
+          }
+
+          chunks.push(chunk)
+          bufferedBytes += chunk.byteLength
+        },
+        flush(controller) {
+          if (passthrough) return
+          const body = new Uint8Array(bufferedBytes)
+          let offset = 0
+          for (const chunk of chunks) {
+            body.set(chunk, offset)
+            offset += chunk.byteLength
+          }
+          try {
+            controller.enqueue(
+              encoder.encode(stripToolPrefix(decoder.decode(body))),
+            )
+          } catch {
+            controller.enqueue(body)
+          }
+        },
+      }),
+    )
+    const headers = headersAfterBodyTransform(response.headers)
+    return new Response(stream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    })
+  }
+  if (mediaType !== 'text/event-stream') return response
 
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
@@ -445,8 +522,7 @@ export function createStrippedStream(response: Response): Response {
     }),
   )
 
-  const headers = new Headers(response.headers)
-  headers.delete('content-length')
+  const headers = headersAfterBodyTransform(response.headers)
 
   return new Response(stream, {
     status: response.status,

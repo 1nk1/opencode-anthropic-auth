@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   createStrippedStream,
+  MAX_RESPONSE_JSON_BYTES,
   MAX_SSE_LINE_BYTES,
   prefixToolNames,
   stripToolPrefix,
@@ -197,17 +198,84 @@ describe('createStrippedStream - correctness guards', () => {
 })
 
 describe('createStrippedStream - transport semantics', () => {
-  test('returns an oversized non-SSE response unchanged', async () => {
+  test('returns an oversized non-JSON response unchanged', async () => {
     const body = new Uint8Array(MAX_SSE_LINE_BYTES + 1).fill(0x78)
     const original = new Response(body, {
       status: 502,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/octet-stream' },
     })
 
     const result = createStrippedStream(original)
 
     expect(result).toBe(original)
     expect((await result.arrayBuffer()).byteLength).toBe(body.byteLength)
+  })
+
+  test('strips tool prefixes from a non-streaming JSON response', async () => {
+    const payload =
+      '{"type":"message","content":[{"type":"tool_use","name":"mcp_Read","input":{}}]}'
+    const response = createStrippedStream(
+      new Response(payload, {
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+      }),
+    )
+
+    expect(await readText(response)).toContain('"name": "read"')
+    expect(response.headers.has('content-length')).toBe(false)
+  })
+
+  test('passes oversized chunked JSON through without the SSE line limit', async () => {
+    const body = new Uint8Array(MAX_RESPONSE_JSON_BYTES + 1).fill(0x78)
+    const response = createStrippedStream(
+      new Response(streamOf([body]), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    expect((await response.arrayBuffer()).byteLength).toBe(body.byteLength)
+  })
+
+  test('passes invalid UTF-8 JSON through byte-for-byte', async () => {
+    const body = new Uint8Array([0x7b, 0x22, 0xff, 0x22, 0x7d])
+    const response = createStrippedStream(
+      new Response(streamOf([body]), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(body)
+  })
+
+  test('strips stale representation headers after JSON transformation', async () => {
+    const response = createStrippedStream(
+      new Response(
+        '{"type":"message","content":[{"type":"tool_use","name":"mcp_Read"}]}',
+        {
+          headers: {
+            'content-digest': 'sha-256=:stale:',
+            'content-encoding': 'gzip',
+            'content-md5': 'stale',
+            'content-range': 'bytes 0-9/10',
+            digest: 'sha-256=stale',
+            etag: '"stale"',
+            'content-type': 'application/problem+json',
+          },
+        },
+      ),
+    )
+
+    expect(await readText(response)).toContain('"name": "read"')
+    for (const name of [
+      'content-digest',
+      'content-encoding',
+      'content-length',
+      'content-md5',
+      'content-range',
+      'digest',
+      'etag',
+    ]) {
+      expect(response.headers.has(name)).toBe(false)
+    }
   })
 
   test('accepts event-stream media type parameters case-insensitively', async () => {
@@ -243,6 +311,18 @@ describe('createStrippedStream - transport semantics', () => {
       }),
     )
     expect(response.headers.get('content-length')).toBeNull()
+  })
+
+  test('strips stale representation headers from transformed SSE', () => {
+    const response = createStrippedStream(
+      sseResponse([TOOL_EVENT], {
+        'content-encoding': 'gzip',
+        etag: '"stale"',
+      }),
+    )
+
+    expect(response.headers.get('content-encoding')).toBeNull()
+    expect(response.headers.get('etag')).toBeNull()
   })
 
   test('propagates an upstream stream error instead of truncating silently', async () => {
