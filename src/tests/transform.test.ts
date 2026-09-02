@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import dedent from 'dedent'
 import {
   CLAUDE_CODE_IDENTITY,
+  CLAUDE_CODE_VERSION,
   OPENCODE_IDENTITY_PREFIX,
   REQUIRED_BETAS,
 } from '../constants'
@@ -225,6 +226,10 @@ describe('stripToolPrefix', () => {
 describe('rewriteUrl', () => {
   const originalEnv = process.env.ANTHROPIC_BASE_URL
 
+  beforeEach(() => {
+    delete process.env.ANTHROPIC_BASE_URL
+  })
+
   afterEach(() => {
     if (originalEnv === undefined) {
       delete process.env.ANTHROPIC_BASE_URL
@@ -422,7 +427,10 @@ describe('createStrippedStream', () => {
       },
     })
 
-    const original = new Response(stream, { status: 200 })
+    const original = new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })
     const stripped = createStrippedStream(original)
 
     const text = await stripped.text()
@@ -442,11 +450,76 @@ describe('createStrippedStream', () => {
     const original = new Response(stream, {
       status: 201,
       statusText: 'Created',
-      headers: { 'x-custom': 'value' },
+      headers: {
+        'content-type': 'text/event-stream',
+        'x-custom': 'value',
+      },
     })
 
     const stripped = createStrippedStream(original)
     expect(stripped.status).toBe(201)
+    expect(stripped.headers.get('x-custom')).toBe('value')
+  })
+
+  test('strips a tool prefix split across arbitrary stream chunks', async () => {
+    const chunks = [
+      'data: {"content_block":{"type":"tool_use","na',
+      'me":"m',
+      'cp_B',
+      'ash"}}\n\n',
+    ]
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+
+    const text = await createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    ).text()
+
+    expect(text).toContain('"name": "bash"')
+    expect(text).not.toContain('mcp_')
+  })
+
+  test('preserves unicode when every input byte is a separate chunk', async () => {
+    const input =
+      'data: {"text":"Привет 👋","content_block":{"name":"mcp_Read"}}\n\n'
+    const bytes = new TextEncoder().encode(input)
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte))
+        controller.close()
+      },
+    })
+
+    const text = await createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    ).text()
+
+    expect(text).toContain('Привет 👋')
+    expect(text).toContain('"name": "read"')
+    expect(text).not.toContain('�')
+  })
+
+  test('drops stale content-length after rewriting the response body', () => {
+    const original = new Response('data: {"name":"mcp_Read"}\n\n', {
+      headers: {
+        'content-type': 'text/event-stream',
+        'content-length': '999',
+        'x-custom': 'value',
+      },
+    })
+
+    const stripped = createStrippedStream(original)
+
+    expect(stripped.headers.get('content-length')).toBeNull()
     expect(stripped.headers.get('x-custom')).toBe('value')
   })
 
@@ -823,6 +896,27 @@ describe('rewriteRequestBody', () => {
 
     // User message is untouched
     expect(result.messages[0].content).toBe('hi')
+  })
+})
+
+describe('reported Claude Code version', () => {
+  // Anthropic gates model access on the version we report, and we report it
+  // twice: in the user-agent header and in the billing header's cc_version.
+  // If those ever disagree, one of them is stale and new models start failing
+  // with a 400 claude_code_version_too_old. Assert both against the constant.
+  test('user-agent and billing header both report CLAUDE_CODE_VERSION', () => {
+    const headers = new Headers()
+    setOAuthHeaders(headers, 'token')
+    expect(headers.get('user-agent')).toBe(
+      `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+    )
+
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'hello world test message' }],
+    })
+    const billingHeader = JSON.parse(rewriteRequestBody(body)).system[0].text
+    // cc_version is `<version>.<3-char suffix>`, so match the version segment.
+    expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
   })
 })
 

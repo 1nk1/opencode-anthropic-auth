@@ -496,7 +496,10 @@ describe('session http.response hook', () => {
         controller.close()
       },
     })
-    const originalResponse = new Response(stream, { status: 200 })
+    const originalResponse = new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })
     const event: any = {
       model: { providerID: 'anthropic', modelID: 'claude-3' },
       request: requestEvent.request,
@@ -543,6 +546,7 @@ describe('session http.response hook', () => {
       request: clonedRequest,
       response: new Response(
         'data: {"content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
+        { headers: { 'content-type': 'text/event-stream' } },
       ),
     }
     await sessionHooks.get('http.response')!(responseEvent)

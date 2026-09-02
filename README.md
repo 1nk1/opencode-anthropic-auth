@@ -40,9 +40,11 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugins": ["@ex-machina/opencode-anthropic-auth@2.0.0"]
+  "plugins": ["@ex-machina/opencode-anthropic-auth@<2.x.y-next.N>"]
 }
 ```
+
+The v2 line ships as prereleases on npm's `next` tag, so substitute a version that actually exists — `npm view @ex-machina/opencode-anthropic-auth dist-tags` shows the current one. Pin that exact version rather than tracking `@next`, which moves on every prerelease publish.
 
 ## Authentication Methods
 
@@ -120,13 +122,15 @@ bun run dev:clean
 
 ### Publishing
 
-This project uses [changesets](https://github.com/changesets/changesets) for versioning and publishing. See the [changeset README](.changeset/README.md) for more details.
+This project uses [changesets](https://github.com/changesets/changesets) for versioning and publishing. See the [changeset README](.changeset/README.md) for contributor details.
 
 ```bash
 bun change          # create a changeset describing your changes
 ```
 
-When changesets are merged to `main`, CI will automatically open a release PR. Merging that PR publishes to npm.
+Changesets merged to a release branch cause CI to open a release PR; merging that PR publishes to npm. This repository runs two release trains — `main` publishes the v1 line to npm's `latest`, and `v2/main` publishes the v2 line to `next` as `2.x.y-next.N` prereleases.
+
+Maintainers: see [RELEASING.md](RELEASING.md) for the full runbook, including how `main` is synced into `v2/main`.
 
 ## License
 
