@@ -380,7 +380,12 @@ describe('auth.loader', () => {
     })
 
     globalThis.fetch = mock(() =>
-      Promise.resolve(new Response(responseStream, { status: 200 })),
+      Promise.resolve(
+        new Response(responseStream, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+      ),
     ) as unknown as typeof fetch
 
     const plugin = await getPlugin()
