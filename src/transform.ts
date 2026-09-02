@@ -12,7 +12,6 @@ import {
 
 // Bound an incomplete SSE line so malformed streams cannot grow memory forever.
 export const MAX_SSE_LINE_BYTES = 5 * 1024 * 1024
-export const MAX_RESPONSE_JSON_BYTES = 5 * 1024 * 1024
 
 function headersAfterBodyTransform(source: Headers): Headers {
   const headers = new Headers(source)
@@ -28,6 +27,222 @@ function headersAfterBodyTransform(source: Headers): Headers {
     headers.delete(name)
   }
   return headers
+}
+
+type JsonToolNameState =
+  | 'after-colon'
+  | 'after-name-key'
+  | 'key-candidate'
+  | 'outside'
+  | 'prefix-candidate'
+  | 'string'
+  | 'tool-name-candidate'
+
+const JSON_NAME_KEY_SUFFIX = new TextEncoder().encode('name"')
+const JSON_TOOL_PREFIX = new TextEncoder().encode(TOOL_PREFIX)
+const UTF8_ENCODER = new TextEncoder()
+const UTF8_FATAL_DECODER = new TextDecoder('utf-8', { fatal: true })
+export const MAX_JSON_TOOL_NAME_BYTES = 1024
+
+function isJsonWhitespace(byte: number): boolean {
+  return byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d
+}
+
+/**
+ * Rewrite JSON `name` string values without buffering the whole document.
+ * Only a bounded tool-name candidate is retained across chunks; all document
+ * content outside that string value is emitted immediately.
+ */
+function createJsonToolNameStream(
+  body: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  let state: JsonToolNameState = 'outside'
+  let held: number[] = []
+  let candidateIndex = 0
+  let escaped = false
+
+  const enterStringAfter = (byte: number) => {
+    if (byte === 0x22) {
+      state = 'outside'
+      escaped = false
+      return
+    }
+    state = 'string'
+    escaped = byte === 0x5c
+  }
+
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        const output = new Uint8Array(chunk.byteLength + 32)
+        let outputLength = 0
+        const write = (byte: number) => {
+          output[outputLength++] = byte
+        }
+        const enqueueOutput = () => {
+          if (outputLength === 0) return
+          controller.enqueue(output.slice(0, outputLength))
+          outputLength = 0
+        }
+        const writeHeld = () => {
+          for (const byte of held) write(byte)
+          held = []
+        }
+        const processOutside = (byte: number) => {
+          if (byte === 0x22) {
+            held = [byte]
+            candidateIndex = 0
+            state = 'key-candidate'
+            return
+          }
+          write(byte)
+        }
+
+        for (const byte of chunk) {
+          if (state === 'outside') {
+            processOutside(byte)
+            continue
+          }
+
+          if (state === 'key-candidate') {
+            if (byte === JSON_NAME_KEY_SUFFIX[candidateIndex]) {
+              held.push(byte)
+              candidateIndex++
+              if (candidateIndex === JSON_NAME_KEY_SUFFIX.byteLength) {
+                writeHeld()
+                state = 'after-name-key'
+              }
+              continue
+            }
+            writeHeld()
+            write(byte)
+            enterStringAfter(byte)
+            continue
+          }
+
+          if (state === 'string') {
+            write(byte)
+            if (escaped) {
+              escaped = false
+            } else if (byte === 0x5c) {
+              escaped = true
+            } else if (byte === 0x22) {
+              state = 'outside'
+            }
+            continue
+          }
+
+          if (state === 'after-name-key') {
+            if (isJsonWhitespace(byte)) {
+              write(byte)
+            } else if (byte === 0x3a) {
+              write(byte)
+              state = 'after-colon'
+            } else {
+              processOutside(byte)
+            }
+            continue
+          }
+
+          if (state === 'after-colon') {
+            if (isJsonWhitespace(byte)) {
+              write(byte)
+            } else if (byte === 0x22) {
+              write(byte)
+              held = []
+              candidateIndex = 0
+              state = 'prefix-candidate'
+            } else {
+              processOutside(byte)
+            }
+            continue
+          }
+
+          if (state === 'prefix-candidate') {
+            if (byte === JSON_TOOL_PREFIX[candidateIndex]) {
+              held.push(byte)
+              candidateIndex++
+              if (candidateIndex === JSON_TOOL_PREFIX.byteLength) {
+                held = []
+                candidateIndex = 0
+                escaped = false
+                state = 'tool-name-candidate'
+              }
+              continue
+            }
+            writeHeld()
+            write(byte)
+            enterStringAfter(byte)
+            continue
+          }
+
+          if (escaped) {
+            held.push(byte)
+            escaped = false
+            if (held.length > MAX_JSON_TOOL_NAME_BYTES) {
+              throw new Error(
+                `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`,
+              )
+            }
+            continue
+          }
+
+          if (byte === 0x5c) {
+            held.push(byte)
+            escaped = true
+            if (held.length > MAX_JSON_TOOL_NAME_BYTES) {
+              throw new Error(
+                `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`,
+              )
+            }
+            continue
+          }
+
+          if (byte === 0x22) {
+            let replacement: Uint8Array
+            if (held.length === 0) {
+              replacement = JSON_TOOL_PREFIX
+            } else {
+              try {
+                replacement = UTF8_ENCODER.encode(
+                  unprefixName(
+                    UTF8_FATAL_DECODER.decode(Uint8Array.from(held)),
+                  ),
+                )
+              } catch {
+                replacement = Uint8Array.from([...JSON_TOOL_PREFIX, ...held])
+              }
+            }
+            enqueueOutput()
+            controller.enqueue(replacement)
+            write(byte)
+            held = []
+            candidateIndex = 0
+            state = 'outside'
+            continue
+          }
+
+          held.push(byte)
+          if (held.length > MAX_JSON_TOOL_NAME_BYTES) {
+            throw new Error(
+              `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`,
+            )
+          }
+        }
+
+        enqueueOutput()
+      },
+      flush(controller) {
+        const trailing = Uint8Array.from(
+          state === 'tool-name-candidate'
+            ? [...JSON_TOOL_PREFIX, ...held]
+            : held,
+        )
+        if (trailing.byteLength === 0) return
+        controller.enqueue(trailing)
+      },
+    }),
+  )
 }
 
 /**
@@ -395,57 +610,7 @@ export function createStrippedStream(response: Response): Response {
     .toLowerCase()
   if (!response.body) return response
   if (mediaType === 'application/json' || mediaType?.endsWith('+json')) {
-    const declaredLength = Number(response.headers.get('content-length'))
-    if (
-      Number.isFinite(declaredLength) &&
-      declaredLength > MAX_RESPONSE_JSON_BYTES
-    ) {
-      return response
-    }
-
-    const decoder = new TextDecoder('utf-8', { fatal: true })
-    const encoder = new TextEncoder()
-    let chunks: Uint8Array[] = []
-    let bufferedBytes = 0
-    let passthrough = false
-    const stream = response.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) {
-          if (passthrough) {
-            controller.enqueue(chunk)
-            return
-          }
-
-          if (bufferedBytes + chunk.byteLength > MAX_RESPONSE_JSON_BYTES) {
-            for (const buffered of chunks) controller.enqueue(buffered)
-            chunks = []
-            bufferedBytes = 0
-            passthrough = true
-            controller.enqueue(chunk)
-            return
-          }
-
-          chunks.push(chunk)
-          bufferedBytes += chunk.byteLength
-        },
-        flush(controller) {
-          if (passthrough) return
-          const body = new Uint8Array(bufferedBytes)
-          let offset = 0
-          for (const chunk of chunks) {
-            body.set(chunk, offset)
-            offset += chunk.byteLength
-          }
-          try {
-            controller.enqueue(
-              encoder.encode(stripToolPrefix(decoder.decode(body))),
-            )
-          } catch {
-            controller.enqueue(body)
-          }
-        },
-      }),
-    )
+    const stream = createJsonToolNameStream(response.body)
     const headers = headersAfterBodyTransform(response.headers)
     return new Response(stream, {
       status: response.status,
