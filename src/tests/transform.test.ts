@@ -246,11 +246,11 @@ describe('rewriteUrl', () => {
     expect(url.searchParams.get('beta')).toBe('true')
   })
 
-  test('does not modify URL if beta param already exists', () => {
+  test('overrides beta=false for /v1/messages', () => {
     const original = 'https://api.anthropic.com/v1/messages?beta=false'
     const { input } = rewriteUrl(original)
     const url = new URL(input.toString())
-    expect(url.searchParams.get('beta')).toBe('false')
+    expect(url.searchParams.get('beta')).toBe('true')
   })
 
   test('does not modify non-/v1/messages URLs', () => {

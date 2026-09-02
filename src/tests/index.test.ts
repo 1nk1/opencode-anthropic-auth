@@ -408,6 +408,12 @@ describe('session http.request hook', () => {
         method: 'POST',
         headers: {
           'content-length': String(body.length),
+          'content-encoding': 'gzip',
+          'content-digest': 'sha-256=:stale:',
+          'content-md5': 'stale',
+          'content-range': 'bytes 0-1/2',
+          digest: 'sha-256=stale',
+          etag: 'stale',
           'x-api-key': 'my-access-token',
         },
         body,
@@ -426,6 +432,12 @@ describe('session http.request hook', () => {
     )
     expect(rewritten.headers.get('x-api-key')).toBeNull()
     expect(rewritten.headers.get('content-length')).toBeNull()
+    expect(rewritten.headers.get('content-encoding')).toBeNull()
+    expect(rewritten.headers.get('content-digest')).toBeNull()
+    expect(rewritten.headers.get('content-md5')).toBeNull()
+    expect(rewritten.headers.get('content-range')).toBeNull()
+    expect(rewritten.headers.get('digest')).toBeNull()
+    expect(rewritten.headers.get('etag')).toBeNull()
     expect(rewritten.redirect).toBe('error')
     expect(rewritten.headers.get('anthropic-beta')).toContain(
       'oauth-2025-04-20',
@@ -455,6 +467,25 @@ describe('session http.request hook', () => {
     const rewritten: Request = event.request
     expect(rewritten.method).toBe('GET')
     expect(await rewritten.text()).toBe('')
+  })
+
+  test('preserves POST requests without a body', async () => {
+    const { ctx, sessionHooks } = anthropicOAuthContext()
+    await plugin.setup(ctx as any)
+
+    const originalRequest = new Request(
+      'https://api.anthropic.com/v1/messages',
+      { method: 'POST' },
+    )
+    const event: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: originalRequest,
+    }
+    await sessionHooks.get('http.request')!(event)
+
+    const rewritten: Request = event.request
+    expect(rewritten.method).toBe('POST')
+    expect(rewritten.body).toBeNull()
   })
 
   test('refuses to send OAuth credentials to an untrusted origin', async () => {

@@ -177,9 +177,11 @@ export function parseAnthropicModelResponse(output: string): string[] {
       ) {
         throw new Error('Invalid model list response')
       }
-      return item.providerID === INTEGRATION_ID
-        ? `${INTEGRATION_ID}/${item.modelID}`
-        : ''
+      if (item.providerID !== INTEGRATION_ID) return ''
+      if (!/^[^\s\p{Cc}]+$/u.test(item.modelID)) {
+        throw new Error('Invalid Anthropic model ID')
+      }
+      return `${INTEGRATION_ID}/${item.modelID}`
     })
     .filter((model) => model !== '')
   const unique = [...new Set(models)].sort()
@@ -497,7 +499,7 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
-async function readBounded(
+export async function readBounded(
   stream: ReadableStream<Uint8Array>,
   maxBytes: number,
   onLimit: () => void,
@@ -507,21 +509,25 @@ async function readBounded(
   let retained = 0
   let total = 0
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    total += value.byteLength
-    const remaining = maxBytes - retained
-    if (remaining > 0) {
-      const chunk = value.subarray(0, remaining).slice()
-      chunks.push(chunk)
-      retained += chunk.byteLength
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      const remaining = maxBytes - retained
+      if (remaining > 0) {
+        const chunk = value.subarray(0, remaining).slice()
+        chunks.push(chunk)
+        retained += chunk.byteLength
+      }
+      if (total > maxBytes) {
+        onLimit()
+        await reader.cancel('command output exceeded the configured limit')
+        break
+      }
     }
-    if (total > maxBytes) {
-      onLimit()
-      await reader.cancel('command output exceeded the configured limit')
-      break
-    }
+  } finally {
+    reader.releaseLock()
   }
 
   const bytes = new Uint8Array(retained)

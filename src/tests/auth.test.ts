@@ -143,6 +143,29 @@ describe('exchange', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
+  test('rejects oversized OAuth inputs before serializing or fetching', async () => {
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((() =>
+      Promise.resolve(new Response(null))) as unknown as typeof fetch)
+
+    expect(
+      await exchange(
+        `${'x'.repeat(16 * 1024)}#state`,
+        'verifier',
+        CODE_CALLBACK_URL,
+        'state',
+      ),
+    ).toEqual({ type: 'failed' })
+    expect(
+      await exchange(
+        'code#state',
+        'v'.repeat(1025),
+        CODE_CALLBACK_URL,
+        'state',
+      ),
+    ).toEqual({ type: 'failed' })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   test('returns failed for a malformed token response', async () => {
     spyOn(globalThis, 'fetch').mockResolvedValue(
       Response.json({ access_token: 'access' }),
@@ -255,6 +278,17 @@ describe('exchange', () => {
 })
 
 describe('refreshToken', () => {
+  test('rejects an oversized refresh token before fetching', async () => {
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((() =>
+      Promise.resolve(new Response(null))) as unknown as typeof fetch)
+
+    expect(await refreshToken('r'.repeat(8 * 1024 + 1))).toEqual({
+      type: 'failed',
+      status: 400,
+    })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   test('exchanges a refresh token for a new access/refresh token pair', async () => {
     let capturedBody: string | undefined
 

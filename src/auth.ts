@@ -27,6 +27,14 @@ type TokenResponse = {
 const TOKEN_TIMEOUT_MS = 30_000
 const MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
 const MAX_TOKEN_LENGTH = 8 * 1024
+const MAX_CALLBACK_INPUT_BYTES = 16 * 1024
+const MAX_VERIFIER_BYTES = 1024
+const MAX_REDIRECT_URI_BYTES = 2 * 1024
+
+function isBoundedUtf8(value: string, maxBytes: number): boolean {
+  if (value.length === 0 || value.length > maxBytes) return false
+  return new TextEncoder().encode(value).byteLength <= maxBytes
+}
 
 function isTokenResponse(value: unknown): value is TokenResponse {
   if (typeof value !== 'object' || value === null) return false
@@ -204,6 +212,7 @@ async function exchangeCode(
   }
 
   if (!result.ok) {
+    await result.body?.cancel().catch(() => {})
     return {
       type: 'failed',
     }
@@ -252,6 +261,16 @@ export async function exchange(
   redirectUri: string,
   expectedState?: string,
 ): Promise<ExchangeResult> {
+  if (
+    !isBoundedUtf8(input, MAX_CALLBACK_INPUT_BYTES) ||
+    !isBoundedUtf8(verifier, MAX_VERIFIER_BYTES) ||
+    !isBoundedUtf8(redirectUri, MAX_REDIRECT_URI_BYTES) ||
+    (expectedState !== undefined &&
+      !isBoundedUtf8(expectedState, MAX_TOKEN_LENGTH))
+  ) {
+    return { type: 'failed' }
+  }
+
   const callback = parseCallbackInput(input)
   if (!callback) {
     return {
@@ -263,6 +282,13 @@ export async function exchange(
     return {
       type: 'failed',
     }
+  }
+
+  if (
+    !isBoundedUtf8(callback.code, MAX_TOKEN_LENGTH) ||
+    !isBoundedUtf8(callback.state, MAX_TOKEN_LENGTH)
+  ) {
+    return { type: 'failed' }
   }
 
   return exchangeCode(callback, verifier, redirectUri)
@@ -281,6 +307,10 @@ export type RefreshResult =
 export async function refreshToken(
   refreshTokenValue: string,
 ): Promise<RefreshResult> {
+  if (!isBoundedUtf8(refreshTokenValue, MAX_TOKEN_LENGTH)) {
+    return { type: 'failed', status: 400 }
+  }
+
   const maxRetries = 2
   const baseDelayMs = 500
 

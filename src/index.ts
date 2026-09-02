@@ -4,6 +4,7 @@ import { BodyLimitError, contentLength, readBoundedText } from './bounded.ts'
 import { REQUIRED_BETAS } from './constants.ts'
 import {
   createStrippedStream,
+  headersAfterBodyTransform,
   isTrustedAnthropicUrl,
   mergeHeaders,
   rewriteRequestBody,
@@ -151,7 +152,7 @@ export default Plugin.define({
         )
       }
 
-      const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
+      const hasBody = request.body !== null
       const declaredLength = contentLength(request.headers)
       if (
         hasBody &&
@@ -173,9 +174,11 @@ export default Plugin.define({
       const rewrittenBody =
         bodyText !== undefined ? rewriteRequestBody(bodyText) : undefined
 
-      const headers = mergeHeaders(request)
+      const headers =
+        rewrittenBody === undefined
+          ? mergeHeaders(request)
+          : headersAfterBodyTransform(mergeHeaders(request))
       setOAuthHeaders(headers, credential.access)
-      if (rewrittenBody !== undefined) headers.delete('content-length')
 
       event.request = new Request(url, {
         method: request.method,

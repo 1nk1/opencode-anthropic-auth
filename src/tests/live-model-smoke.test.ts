@@ -28,6 +28,7 @@ import {
   parseExactSessionIDs,
   parsePreflightResult,
   parsePrivateServerURL,
+  readBounded,
   readBoundedUtf8File,
   runCommand,
   writePrivateReport,
@@ -320,6 +321,22 @@ describe('live model discovery', () => {
       ),
     ).toThrow('maximum is 256')
   })
+
+  test.each([
+    '',
+    '   ',
+    'model id',
+    'model\u0000id',
+    'model\u001bid',
+  ])('rejects invalid Anthropic model ID %j', (modelID) => {
+    expect(() =>
+      parseAnthropicModelResponse(
+        JSON.stringify({
+          data: [{ providerID: 'anthropic', modelID }],
+        }),
+      ),
+    ).toThrow('Invalid Anthropic model ID')
+  })
 })
 
 describe('live model preflight', () => {
@@ -454,6 +471,34 @@ describe('live model preflight', () => {
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
+  })
+
+  test('releases bounded stream readers after completion and cancellation', async () => {
+    const completed = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('ok'))
+        controller.close()
+      },
+    })
+    expect(await readBounded(completed, 8, () => {})).toEqual({
+      text: 'ok',
+      truncated: false,
+    })
+    completed.getReader().releaseLock()
+
+    let limited = false
+    const oversized = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('too large'))
+      },
+    })
+    expect(
+      await readBounded(oversized, 3, () => {
+        limited = true
+      }),
+    ).toEqual({ text: 'too', truncated: true })
+    expect(limited).toBe(true)
+    oversized.getReader().releaseLock()
   })
 
   test('accepts only a loopback private server URL', () => {

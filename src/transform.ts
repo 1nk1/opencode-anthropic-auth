@@ -16,10 +16,9 @@ import {
 
 // Bound an incomplete SSE line so malformed streams cannot grow memory forever.
 export const MAX_SSE_LINE_BYTES = 5 * 1024 * 1024
-export const MAX_RESPONSE_JSON_BYTES = 5 * 1024 * 1024
 export { MAX_JSON_TOOL_NAME_BYTES }
 
-function headersAfterBodyTransform(source: Headers): Headers {
+export function headersAfterBodyTransform(source: Headers): Headers {
   const headers = new Headers(source)
   for (const name of [
     'content-digest',
@@ -397,10 +396,7 @@ export function rewriteUrl(input: FetchInput): {
 
   const originalHref = requestUrl.href
 
-  if (
-    requestUrl.pathname === '/v1/messages' &&
-    !requestUrl.searchParams.has('beta')
-  ) {
+  if (requestUrl.pathname === '/v1/messages') {
     requestUrl.searchParams.set('beta', 'true')
   }
 

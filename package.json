@@ -1,6 +1,6 @@
 {
   "name": "@1nk1/opencode-anthropic-auth",
-  "version": "2.0.0-beta.6",
+  "version": "2.0.0-beta.7",
   "type": "module",
   "license": "MIT",
   "author": {
@@ -40,12 +40,13 @@
     "dist"
   ],
   "scripts": {
-    "prepack": "bun run verify && bun run build && bun run scan:unicode-stego --require-text dist",
-    "build": "tsc -p tsconfig.build.json",
+    "prepack": "bun run verify && bun run scan:unicode-stego --require-text dist",
+    "clean": "bun -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "bun run clean && tsc -p tsconfig.build.json",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "extract": "bun scripts/extract-system-prompt.ts",
-    "test": "bun test",
+    "test": "bun run build && bun test",
     "test:live-models": "bun scripts/live-model-smoke.ts",
     "types": "tsc",
     "format": "biome check --write --unsafe",
@@ -53,7 +54,7 @@
     "lint": "biome lint .",
     "audit": "bun audit --audit-level=high",
     "scan:unicode-stego": "bun scripts/scan-unicode-stego.ts",
-    "verify": "bun test && bun run types && bun run lint && bun run format:check && bun run audit && bun run scan:unicode-stego"
+    "verify": "bun run test && bun run types && bun run lint && bun run format:check && bun run audit && bun run scan:unicode-stego"
   },
   "dependencies": {
     "@opencode-ai/plugin": "0.0.0-beta-18866",

@@ -7,7 +7,6 @@ import {
 import {
   createStrippedStream,
   MAX_JSON_TOOL_NAME_BYTES,
-  MAX_RESPONSE_JSON_BYTES,
   MAX_SSE_LINE_BYTES,
   prefixToolNames,
   stripToolPrefix,
@@ -351,8 +350,8 @@ describe('createStrippedStream - transport semantics', () => {
     expect(response.headers.has('content-length')).toBe(false)
   })
 
-  test('rejects malformed oversized JSON', async () => {
-    const body = new Uint8Array(MAX_RESPONSE_JSON_BYTES + 1).fill(0x78)
+  test('rejects malformed JSON', async () => {
+    const body = new TextEncoder().encode('not-json')
     const response = createStrippedStream(
       new Response(streamOf([body]), {
         headers: { 'content-type': 'application/json' },
@@ -360,6 +359,18 @@ describe('createStrippedStream - transport semantics', () => {
     )
 
     await expect(response.arrayBuffer()).rejects.toThrow()
+  })
+
+  test('bounds buffered JSON between emitted tokens', async () => {
+    const payload = `{"value":1 ${' '.repeat(MAX_JSON_STRING_BYTES + 4096)}`
+    const response = createStrippedStream(
+      new Response(streamOf([payload]), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    await expect(readText(response)).rejects.toThrow(
+      'Anthropic response JSON exceeds bounded token buffer',
+    )
   })
 
   test('rejects invalid UTF-8 JSON', async () => {
@@ -603,7 +614,8 @@ describe('bounded structured JSON responses', () => {
   })
 
   test('rewrites a document above the former whole-document limit', async () => {
-    const payload = `{"type":"message","content":[{"type":"tool_use","name":"mcp_Read","input":{"padding":"${'x'.repeat(MAX_RESPONSE_JSON_BYTES + 1)}"}}]}`
+    const formerWholeDocumentLimit = 5 * 1024 * 1024
+    const payload = `{"type":"message","content":[{"type":"tool_use","name":"mcp_Read","input":{"padding":"${'x'.repeat(formerWholeDocumentLimit + 1)}"}}]}`
     const output = await readText(jsonResponse(payload))
     expect(output.startsWith('{"type":"message"')).toBe(true)
     expect(output).toContain('"name":"read"')
