@@ -9,6 +9,31 @@ import {
   TOOL_PREFIX,
   USER_AGENT,
 } from './constants.ts'
+import {
+  createBoundedJsonToolNameStream,
+  MAX_JSON_TOOL_NAME_BYTES,
+} from './json-response-stream.ts'
+
+// Bound an incomplete SSE line so malformed streams cannot grow memory forever.
+export const MAX_SSE_LINE_BYTES = 5 * 1024 * 1024
+export const MAX_RESPONSE_JSON_BYTES = 5 * 1024 * 1024
+export { MAX_JSON_TOOL_NAME_BYTES }
+
+function headersAfterBodyTransform(source: Headers): Headers {
+  const headers = new Headers(source)
+  for (const name of [
+    'content-digest',
+    'content-encoding',
+    'content-length',
+    'content-md5',
+    'content-range',
+    'digest',
+    'etag',
+  ]) {
+    headers.delete(name)
+  }
+  return headers
+}
 
 /**
  * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
@@ -148,42 +173,209 @@ export function stripToolPrefix(text: string): string {
   )
 }
 
-/**
- * Check if TLS verification should be skipped for custom API endpoints.
- * Only effective when ANTHROPIC_BASE_URL is also set.
- */
-export function isInsecure(): boolean {
-  if (!process.env.ANTHROPIC_BASE_URL?.trim()) return false
-  const raw = process.env.ANTHROPIC_INSECURE?.trim()
-  return raw === '1' || raw === 'true'
+type JsonPath = Array<string | number>
+
+type JsonReplacement = {
+  path: JsonPath
+  value: string
+}
+
+const MAX_RESPONSE_JSON_NODES = 100_000
+const MAX_RESPONSE_JSON_DEPTH = 256
+
+function isToolUse(value: unknown): value is Record<string, unknown> & {
+  name: string
+} {
+  return (
+    isRecord(value) &&
+    value.type === 'tool_use' &&
+    typeof value.name === 'string' &&
+    value.name.startsWith(TOOL_PREFIX)
+  )
+}
+
+function responseToolNameReplacements(value: unknown): JsonReplacement[] {
+  if (!isRecord(value)) return []
+
+  if (value.type === 'content_block_start' && isToolUse(value.content_block)) {
+    return [
+      {
+        path: ['content_block', 'name'],
+        value: unprefixName(value.content_block.name.slice(TOOL_PREFIX.length)),
+      },
+    ]
+  }
+
+  if (value.type !== 'message' || !Array.isArray(value.content)) return []
+
+  const replacements: JsonReplacement[] = []
+  for (let index = 0; index < value.content.length; index++) {
+    const block = value.content[index]
+    if (!isToolUse(block)) continue
+    replacements.push({
+      path: ['content', index, 'name'],
+      value: unprefixName(block.name.slice(TOOL_PREFIX.length)),
+    })
+  }
+  return replacements
+}
+
+function pathKey(path: JsonPath): string {
+  return JSON.stringify(path)
+}
+
+function rewriteJsonStringTokens(
+  text: string,
+  replacements: JsonReplacement[],
+): string {
+  if (replacements.length === 0) return text
+
+  const wanted = new Map(
+    replacements.map((replacement) => [
+      pathKey(replacement.path),
+      JSON.stringify(replacement.value),
+    ]),
+  )
+  const edits = new Map<string, { start: number; end: number; value: string }>()
+  let visited = 0
+
+  function failLimits() {
+    throw new Error('Anthropic response JSON exceeds traversal limits')
+  }
+
+  function skipWhitespace(offset: number): number {
+    while (/\s/.test(text[offset] ?? '')) offset++
+    return offset
+  }
+
+  function scanString(offset: number): number {
+    let cursor = offset + 1
+    while (cursor < text.length) {
+      const char = text[cursor]
+      if (char === '"') return cursor + 1
+      if (char === '\\') cursor++
+      cursor++
+    }
+    return text.length
+  }
+
+  function walkValue(offset: number, path: JsonPath, depth: number): number {
+    visited++
+    if (visited > MAX_RESPONSE_JSON_NODES || depth > MAX_RESPONSE_JSON_DEPTH) {
+      failLimits()
+    }
+
+    let cursor = skipWhitespace(offset)
+    const char = text[cursor]
+    if (char === '"') {
+      const end = scanString(cursor)
+      const key = pathKey(path)
+      const replacement = wanted.get(key)
+      if (replacement !== undefined) {
+        edits.set(key, { start: cursor, end, value: replacement })
+      }
+      return end
+    }
+
+    if (char === '{') {
+      cursor = skipWhitespace(cursor + 1)
+      while (text[cursor] !== '}' && cursor < text.length) {
+        const keyStart = cursor
+        const keyEnd = scanString(keyStart)
+        const key: string = JSON.parse(text.slice(keyStart, keyEnd))
+        cursor = skipWhitespace(keyEnd)
+        cursor = skipWhitespace(cursor + 1)
+        cursor = walkValue(cursor, [...path, key], depth + 1)
+        cursor = skipWhitespace(cursor)
+        if (text[cursor] === ',') cursor = skipWhitespace(cursor + 1)
+      }
+      return cursor + 1
+    }
+
+    if (char === '[') {
+      cursor = skipWhitespace(cursor + 1)
+      let index = 0
+      while (text[cursor] !== ']' && cursor < text.length) {
+        cursor = walkValue(cursor, [...path, index], depth + 1)
+        index++
+        cursor = skipWhitespace(cursor)
+        if (text[cursor] === ',') cursor = skipWhitespace(cursor + 1)
+      }
+      return cursor + 1
+    }
+
+    while (cursor < text.length && !/[\s,\]}]/.test(text[cursor] ?? '')) {
+      cursor++
+    }
+    return cursor
+  }
+
+  walkValue(0, [], 0)
+
+  let output = text
+  const orderedEdits = [...edits.values()].sort(
+    (left, right) => right.start - left.start,
+  )
+  for (const edit of orderedEdits) {
+    output = output.slice(0, edit.start) + edit.value + output.slice(edit.end)
+  }
+  return output
+}
+
+function rewriteResponseJson(text: string): string | undefined {
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+
+  return rewriteJsonStringTokens(text, responseToolNameReplacements(value))
+}
+
+function stripResponseToolPrefix(text: string): string {
+  if (!text.includes('mcp_')) return text
+
+  let first = 0
+  while (first < text.length) {
+    const code = text.charCodeAt(first)
+    if (code !== 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) break
+    first++
+  }
+  const firstCode = text.charCodeAt(first)
+  if (firstCode === 0x7b || firstCode === 0x5b) {
+    const document = rewriteResponseJson(text)
+    if (document !== undefined) return document
+  }
+
+  return text.replace(
+    /(^|[\r\n])(data:[ \t]*)([^\r\n]*)/g,
+    (line, lineStart: string, field: string, payload: string) => {
+      if (!payload.includes('mcp_')) return line
+      const rewritten = rewriteResponseJson(payload)
+      return rewritten === undefined ? line : `${lineStart}${field}${rewritten}`
+    },
+  )
 }
 
 /**
- * Parse ANTHROPIC_BASE_URL from the environment.
- * Returns a valid HTTP(S) URL or null if unset/invalid.
+ * Allow OAuth bearer credentials only for Anthropic's official HTTPS API.
  */
-function resolveBaseUrl(): URL | null {
-  const raw = process.env.ANTHROPIC_BASE_URL?.trim()
-  if (!raw) return null
+export function isTrustedAnthropicUrl(input: string | URL): boolean {
   try {
-    const baseUrl = new URL(raw)
-    if (
-      (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') ||
-      baseUrl.username ||
-      baseUrl.password
-    ) {
-      return null
-    }
-    return baseUrl
+    const url = new URL(input.toString())
+    return (
+      url.origin === 'https://api.anthropic.com' &&
+      url.username === '' &&
+      url.password === ''
+    )
   } catch {
-    return null
+    return false
   }
 }
 
 /**
  * Rewrite the request URL to add ?beta=true for /v1/messages requests.
- * When ANTHROPIC_BASE_URL is set, overrides the origin (protocol + host)
- * for all API requests flowing through the fetch wrapper.
  * Returns the modified input and URL (if applicable).
  */
 export function rewriteUrl(input: FetchInput): {
@@ -204,12 +396,6 @@ export function rewriteUrl(input: FetchInput): {
   if (!requestUrl) return { input, url: null }
 
   const originalHref = requestUrl.href
-
-  const baseUrl = resolveBaseUrl()
-  if (baseUrl) {
-    requestUrl.protocol = baseUrl.protocol
-    requestUrl.host = baseUrl.host
-  }
 
   if (
     requestUrl.pathname === '/v1/messages' &&
@@ -368,29 +554,101 @@ export function rewriteRequestBody(body: string): string {
  * Create a streaming response that strips the tool prefix from tool names.
  */
 export function createStrippedStream(response: Response): Response {
+  const mediaType = response.headers
+    .get('content-type')
+    ?.split(';', 1)[0]
+    ?.trim()
+    .toLowerCase()
   if (!response.body) return response
+  if (mediaType === 'application/json' || mediaType?.endsWith('+json')) {
+    const stream = createBoundedJsonToolNameStream(
+      response.body,
+      TOOL_PREFIX,
+      unprefixName,
+    )
+    const headers = headersAfterBodyTransform(response.headers)
+    return new Response(stream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    })
+  }
+  if (mediaType !== 'text/event-stream') return response
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
+  const decoder = new TextDecoder('utf-8', { fatal: true })
   const encoder = new TextEncoder()
+  let pending = new Uint8Array(0)
+  let pendingLength = 0
 
-  const stream = new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-        return
+  const appendPending = (bytes: Uint8Array) => {
+    const requiredLength = pendingLength + bytes.byteLength
+    if (requiredLength > MAX_SSE_LINE_BYTES) {
+      throw new Error(`SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`)
+    }
+
+    if (requiredLength > pending.byteLength) {
+      let capacity = Math.max(1024, pending.byteLength)
+      while (capacity < requiredLength) {
+        capacity = Math.min(MAX_SSE_LINE_BYTES, capacity * 2)
       }
+      const expanded = new Uint8Array(capacity)
+      expanded.set(pending.subarray(0, pendingLength))
+      pending = expanded
+    }
 
-      let text = decoder.decode(value, { stream: true })
-      text = stripToolPrefix(text)
-      controller.enqueue(encoder.encode(text))
-    },
-  })
+    pending.set(bytes, pendingLength)
+    pendingLength = requiredLength
+  }
+
+  const stream = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        let lastLineBreak = -1
+        let lineLength = pendingLength
+        for (let index = 0; index < chunk.byteLength; index++) {
+          if (chunk[index] === 0x0a || chunk[index] === 0x0d) {
+            lastLineBreak = index
+            lineLength = 0
+          } else {
+            lineLength++
+            if (lineLength > MAX_SSE_LINE_BYTES) {
+              throw new Error(
+                `SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`,
+              )
+            }
+          }
+        }
+
+        if (lastLineBreak < 0) {
+          appendPending(chunk)
+          return
+        }
+
+        const completeLines =
+          decoder.decode(pending.subarray(0, pendingLength), {
+            stream: true,
+          }) + decoder.decode(chunk.subarray(0, lastLineBreak + 1))
+
+        pendingLength = 0
+        appendPending(chunk.subarray(lastLineBreak + 1))
+        controller.enqueue(
+          encoder.encode(stripResponseToolPrefix(completeLines)),
+        )
+      },
+      flush(controller) {
+        const trailing = decoder.decode(pending.subarray(0, pendingLength))
+        if (trailing) {
+          controller.enqueue(encoder.encode(stripResponseToolPrefix(trailing)))
+        }
+      },
+    }),
+  )
+
+  const headers = headersAfterBodyTransform(response.headers)
 
   return new Response(stream, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers,
   })
 }

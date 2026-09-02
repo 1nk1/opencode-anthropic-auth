@@ -5,6 +5,7 @@
     "outDir": "dist",
     "types": ["bun-types"],
     "declaration": true,
+    "removeComments": true,
     "noEmit": false,
     "allowImportingTsExtensions": true,
     "rewriteRelativeImportExtensions": true

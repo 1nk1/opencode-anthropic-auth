@@ -27,8 +27,8 @@ describe('billing header helpers', () => {
   })
 
   test('computes the 3-character version suffix', () => {
-    expect(computeVersionSuffix('hello world test message', '2.1.87')).toBe(
-      '6ff',
+    expect(computeVersionSuffix('hello world test message', '2.1.258')).toBe(
+      'ef1',
     )
   })
 
@@ -36,11 +36,11 @@ describe('billing header helpers', () => {
     expect(
       buildBillingHeaderValue(
         [{ role: 'user', content: 'hello world test message' }],
-        '2.1.87',
+        '2.1.258',
         'sdk-cli',
       ),
     ).toBe(
-      'x-anthropic-billing-header: cc_version=2.1.87.6ff; cc_entrypoint=sdk-cli; cch=4ffc3;',
+      'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=sdk-cli; cch=4ffc3;',
     )
   })
 })
