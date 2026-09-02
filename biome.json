@@ -15,6 +15,11 @@
   "linter": {
     "enabled": true
   },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
   "files": {
     "ignoreUnknown": true,
     "includes": ["src/**", "scripts/**", "*.json", "*.yml"]

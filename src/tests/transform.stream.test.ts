@@ -1,0 +1,587 @@
+import { describe, expect, test } from 'bun:test'
+import {
+  createStrippedStream,
+  MAX_JSON_TOOL_NAME_BYTES,
+  MAX_SSE_LINE_BYTES,
+  prefixToolNames,
+  stripToolPrefix,
+} from '../transform'
+
+const encoder = new TextEncoder()
+
+function streamOf(
+  chunks: Array<string | Uint8Array>,
+): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(
+          typeof chunk === 'string' ? encoder.encode(chunk) : chunk,
+        )
+      }
+      controller.close()
+    },
+  })
+}
+
+function sseResponse(
+  chunks: Array<string | Uint8Array>,
+  headers: Record<string, string> = {},
+): Response {
+  return new Response(streamOf(chunks), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream', ...headers },
+  })
+}
+
+async function readText(response: Response): Promise<string> {
+  return await new Response(response.body).text()
+}
+
+const TOOL_EVENT =
+  'event: content_block_start\n' +
+  'data: {"type":"content_block_start","index":0,' +
+  '"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp_Read","input":{}}}\n\n'
+
+// stripToolPrefix normalises to `"name": "x"` and lower-cases the first letter.
+const EXPECTED = TOOL_EVENT.replace('"name":"mcp_Read"', '"name": "read"')
+
+describe('createStrippedStream - chunk boundaries', () => {
+  test('strips the prefix at every possible two-chunk split point', async () => {
+    for (let index = 1; index < TOOL_EVENT.length; index++) {
+      const chunks = [TOOL_EVENT.slice(0, index), TOOL_EVENT.slice(index)]
+      expect(await readText(createStrippedStream(sseResponse(chunks)))).toBe(
+        EXPECTED,
+      )
+    }
+  })
+
+  test('strips a prefix delivered one byte per chunk', async () => {
+    const bytes = Array.from(
+      encoder.encode(TOOL_EVENT),
+      (byte) => new Uint8Array([byte]),
+    )
+    expect(await readText(createStrippedStream(sseResponse(bytes)))).toBe(
+      EXPECTED,
+    )
+  })
+
+  test('tolerates interleaved empty chunks', async () => {
+    const chunks = ['', TOOL_EVENT.slice(0, 20), '', TOOL_EVENT.slice(20), '']
+    expect(await readText(createStrippedStream(sseResponse(chunks)))).toBe(
+      EXPECTED,
+    )
+  })
+
+  test('preserves a 4-byte emoji split across chunks', async () => {
+    const payload =
+      'data: {"type":"content_block_delta","delta":{"text":"\u{1F680} ok"}}\n\n'
+    const bytes = encoder.encode(payload)
+    const cut = bytes.indexOf(0xf0) + 2
+    const output = await readText(
+      createStrippedStream(
+        sseResponse([bytes.slice(0, cut), bytes.slice(cut)]),
+      ),
+    )
+    expect(output).toBe(payload)
+  })
+
+  test('flushes a dangling partial prefix at end of stream', async () => {
+    const partial = 'data: {"name":"mcp'
+    expect(await readText(createStrippedStream(sseResponse([partial])))).toBe(
+      partial,
+    )
+  })
+})
+
+describe('createStrippedStream - correctness guards', () => {
+  test('handles CR-only SSE line endings', async () => {
+    const payload = 'data: {"name":"mcp_Read"}\r\r'
+    const expected = 'data: {"name": "read"}\r\r'
+    const chunks = payload.split('')
+
+    expect(await readText(createStrippedStream(sseResponse(chunks)))).toBe(
+      expected,
+    )
+  })
+
+  test('preserves CRLF endings split across chunks', async () => {
+    const expected = 'data: {"name": "read"}\r\n\r\n'
+    const chunks = ['data: {"name":"mcp_', 'Read"}\r', '\n\r', '\n']
+
+    expect(await readText(createStrippedStream(sseResponse(chunks)))).toBe(
+      expected,
+    )
+  })
+
+  test('rejects a newline-free SSE line above the buffer limit', async () => {
+    const oversized = `data: ${'x'.repeat(MAX_SSE_LINE_BYTES)}`
+    const response = createStrippedStream(sseResponse([oversized]))
+
+    await expect(readText(response)).rejects.toThrow(
+      `SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`,
+    )
+  })
+
+  test('rejects an oversized line ending in the same chunk', async () => {
+    const oversized = `${'x'.repeat(MAX_SSE_LINE_BYTES + 1)}\n`
+    const response = createStrippedStream(sseResponse([oversized]))
+
+    await expect(readText(response)).rejects.toThrow(
+      `SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`,
+    )
+  })
+
+  test('accepts a large chunk containing many bounded lines', async () => {
+    const line = 'data: x\n'
+    const payload = line.repeat(Math.ceil(MAX_SSE_LINE_BYTES / line.length))
+
+    expect(await readText(createStrippedStream(sseResponse([payload])))).toBe(
+      payload,
+    )
+  })
+
+  test('accepts a line exactly at the buffer limit', async () => {
+    const payload = 'x'.repeat(MAX_SSE_LINE_BYTES)
+
+    expect(await readText(createStrippedStream(sseResponse([payload])))).toBe(
+      payload,
+    )
+  })
+
+  test('enforces the byte limit for multi-byte UTF-8 input', async () => {
+    const payload = '🚀'.repeat(Math.floor(MAX_SSE_LINE_BYTES / 4) + 1)
+    const response = createStrippedStream(sseResponse([payload]))
+
+    await expect(readText(response)).rejects.toThrow(
+      `SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`,
+    )
+  })
+
+  test('is a no-op for a stream with no prefixed names', async () => {
+    const payload = 'data: {"type":"message_stop"}\n\ndata: [DONE]\n\n'
+    expect(await readText(createStrippedStream(sseResponse([payload])))).toBe(
+      payload,
+    )
+  })
+
+  test('strips several tool names in a single chunk', async () => {
+    const payload = ['mcp_Read', 'mcp_Write', 'mcp_Shell']
+      .map((name) => `data: {"name":"${name}"}\n\n`)
+      .join('')
+    const expected = ['read', 'write', 'shell']
+      .map((name) => `data: {"name": "${name}"}\n\n`)
+      .join('')
+    expect(await readText(createStrippedStream(sseResponse([payload])))).toBe(
+      expected,
+    )
+  })
+
+  test('strips a very long name spanning many chunks', async () => {
+    const payload = `data: {"name":"mcp_${'A'.repeat(300)}"}\n\n`
+    const expected = `data: {"name": "a${'A'.repeat(299)}"}\n\n`
+    const chunks = payload.match(/.{1,7}/gs) ?? []
+    expect(await readText(createStrippedStream(sseResponse(chunks)))).toBe(
+      expected,
+    )
+  })
+
+  test('normalises whitespace variants of the name field', () => {
+    expect(stripToolPrefix('{"name"  :  "mcp_Read"}')).toBe('{"name": "read"}')
+  })
+
+  test('keeps StructuredOutput unchanged apart from the prefix', () => {
+    expect(stripToolPrefix('{"name":"mcp_StructuredOutput"}')).toBe(
+      '{"name": "StructuredOutput"}',
+    )
+  })
+})
+
+describe('createStrippedStream - transport semantics', () => {
+  test('returns an oversized non-JSON response unchanged', async () => {
+    const body = new Uint8Array(MAX_SSE_LINE_BYTES + 1).fill(0x78)
+    const original = new Response(body, {
+      status: 502,
+      headers: { 'content-type': 'application/octet-stream' },
+    })
+
+    const result = createStrippedStream(original)
+
+    expect(result).toBe(original)
+    expect((await result.arrayBuffer()).byteLength).toBe(body.byteLength)
+  })
+
+  test('strips tool prefixes from a non-streaming JSON response', async () => {
+    const payload =
+      '{"type":"message","content":[{"type":"tool_use","name":"mcp_Read","input":{}}]}'
+    const response = createStrippedStream(
+      new Response(payload, {
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+      }),
+    )
+
+    expect(await readText(response)).toContain('"name":"read"')
+    expect(response.headers.has('content-length')).toBe(false)
+  })
+
+  test('rewrites tool names in JSON larger than the former limit', async () => {
+    const padding = 'x'.repeat(MAX_SSE_LINE_BYTES + 1)
+    const payload =
+      '{"type":"message","content":[' +
+      '{"type":"tool_use","name":"mcp_Read","input":{}},' +
+      `{"type":"text","text":"${padding}"},` +
+      '{"type":"tool_use","name":"mcp_Write","input":{}}]}'
+    const bytes = encoder.encode(payload)
+    const chunks: Uint8Array[] = []
+    for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
+      chunks.push(bytes.subarray(offset, offset + 64 * 1024))
+    }
+    for (const declaredLength of [false, true]) {
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      }
+      if (declaredLength) headers['content-length'] = String(bytes.byteLength)
+      const response = createStrippedStream(
+        new Response(streamOf(chunks), { headers }),
+      )
+
+      const output = await readText(response)
+      expect(output).toContain('"name":"read"')
+      expect(output).toContain('"name":"write"')
+      expect(output).not.toContain('mcp_')
+      expect(output.length).toBe(payload.length - 8)
+    }
+  })
+
+  test('rewrites JSON names across every relevant byte split', async () => {
+    const payload =
+      '{"type":"message","content":[{"type":"tool_use","name"  :  "mcp_Read","input":{}}]}'
+    const expected = payload.replace('mcp_Read', 'read')
+    const bytes = encoder.encode(payload)
+
+    for (let index = 1; index < bytes.byteLength; index++) {
+      const response = createStrippedStream(
+        new Response(
+          streamOf([bytes.subarray(0, index), bytes.subarray(index)]),
+          {
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      )
+      expect(await readText(response)).toBe(expected)
+    }
+  })
+
+  test('preserves UTF-8 while rewriting JSON delivered one byte at a time', async () => {
+    const payload = '{"text":"Привет 🚀","name":"mcp_Read","tail":"готово"}'
+    const chunks = Array.from(
+      encoder.encode(payload),
+      (byte) => new Uint8Array([byte]),
+    )
+    const response = createStrippedStream(
+      new Response(streamOf(chunks), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    expect(await readText(response)).toBe(payload.replace('mcp_Read', 'read'))
+  })
+
+  test('lowercases a raw non-ASCII first code point across byte splits', async () => {
+    for (const name of ['Äbc', 'Ωmega', 'Бeta']) {
+      const payload = `{"name":"mcp_${name}"}`
+      const expected = stripToolPrefix(payload)
+      const chunks = Array.from(
+        encoder.encode(payload),
+        (byte) => new Uint8Array([byte]),
+      )
+      const response = createStrippedStream(
+        new Response(streamOf(chunks), {
+          headers: { 'content-type': 'application/json' },
+        }),
+      )
+
+      expect(await readText(response)).toBe(
+        expected.replace('"name": "', '"name":"'),
+      )
+    }
+  })
+
+  test('preserves a truncated non-ASCII tool name byte-for-byte', async () => {
+    for (const name of ['Ä', 'Ω', 'Б']) {
+      const payload = `{"name":"mcp_${name}`
+      const chunks = Array.from(
+        encoder.encode(payload),
+        (byte) => new Uint8Array([byte]),
+      )
+      const response = createStrippedStream(
+        new Response(streamOf(chunks), {
+          headers: { 'content-type': 'application/json' },
+        }),
+      )
+
+      expect(await readText(response)).toBe(payload)
+    }
+  })
+
+  test('bounds a single JSON tool name without bounding the document', async () => {
+    const accepted = `{"name":"mcp_${'A'.repeat(MAX_JSON_TOOL_NAME_BYTES)}"}`
+    const rejected = `{"name":"mcp_${'A'.repeat(MAX_JSON_TOOL_NAME_BYTES + 1)}"}`
+
+    expect(
+      await readText(
+        createStrippedStream(
+          new Response(streamOf([accepted]), {
+            headers: { 'content-type': 'application/json' },
+          }),
+        ),
+      ),
+    ).toBe(`{"name":"a${'A'.repeat(MAX_JSON_TOOL_NAME_BYTES - 1)}"}`)
+
+    await expect(
+      readText(
+        createStrippedStream(
+          new Response(streamOf([rejected]), {
+            headers: { 'content-type': 'application/json' },
+          }),
+        ),
+      ),
+    ).rejects.toThrow(
+      `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`,
+    )
+  })
+
+  test('does not rewrite an escaped name field inside JSON text', async () => {
+    const payload = '{"text":"\\"name\\":\\"mcp_Read\\"","name":"plain"}'
+    const response = createStrippedStream(
+      new Response(streamOf([payload]), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    expect(await readText(response)).toBe(payload)
+  })
+
+  test('keeps StructuredOutput casing in non-streaming JSON', async () => {
+    const payload = '{"name":"mcp_StructuredOutput"}'
+    const response = createStrippedStream(
+      new Response(streamOf([payload]), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    expect(await readText(response)).toBe('{"name":"StructuredOutput"}')
+  })
+
+  test('preserves an empty tool name prefix across chunk and EOF boundaries', async () => {
+    for (const payload of ['{"name":"mcp_"}', '{"name":"mcp_']) {
+      const bytes = encoder.encode(payload)
+      const chunks = Array.from(bytes, (byte) => new Uint8Array([byte]))
+      const response = createStrippedStream(
+        new Response(streamOf(chunks), {
+          headers: { 'content-type': 'application/json' },
+        }),
+      )
+
+      expect(await readText(response)).toBe(payload)
+    }
+  })
+
+  test('passes invalid UTF-8 JSON through byte-for-byte', async () => {
+    const body = new Uint8Array([0x7b, 0x22, 0xff, 0x22, 0x7d])
+    const response = createStrippedStream(
+      new Response(streamOf([body]), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(body)
+  })
+
+  test('strips stale representation headers after JSON transformation', async () => {
+    const response = createStrippedStream(
+      new Response(
+        '{"type":"message","content":[{"type":"tool_use","name":"mcp_Read"}]}',
+        {
+          headers: {
+            'content-digest': 'sha-256=:stale:',
+            'content-encoding': 'gzip',
+            'content-md5': 'stale',
+            'content-range': 'bytes 0-9/10',
+            digest: 'sha-256=stale',
+            etag: '"stale"',
+            'content-type': 'application/problem+json',
+          },
+        },
+      ),
+    )
+
+    expect(await readText(response)).toContain('"name":"read"')
+    for (const name of [
+      'content-digest',
+      'content-encoding',
+      'content-length',
+      'content-md5',
+      'content-range',
+      'digest',
+      'etag',
+    ]) {
+      expect(response.headers.has(name)).toBe(false)
+    }
+  })
+
+  test('accepts event-stream media type parameters case-insensitively', async () => {
+    const response = createStrippedStream(
+      sseResponse([TOOL_EVENT], {
+        'content-type': 'Text/Event-Stream; charset=utf-8',
+      }),
+    )
+
+    expect(await readText(response)).toBe(EXPECTED)
+  })
+
+  test('preserves status, statusText and passthrough headers', () => {
+    const response = createStrippedStream(
+      new Response(streamOf([TOOL_EVENT]), {
+        status: 207,
+        statusText: 'Multi-Status',
+        headers: {
+          'content-type': 'text/event-stream',
+          'x-request-id': 'req_1',
+        },
+      }),
+    )
+    expect(response.status).toBe(207)
+    expect(response.headers.get('content-type')).toBe('text/event-stream')
+    expect(response.headers.get('x-request-id')).toBe('req_1')
+  })
+
+  test('drops content-length because the body length changes', () => {
+    const response = createStrippedStream(
+      sseResponse([TOOL_EVENT], {
+        'content-length': String(TOOL_EVENT.length),
+      }),
+    )
+    expect(response.headers.get('content-length')).toBeNull()
+  })
+
+  test('strips stale representation headers from transformed SSE', () => {
+    const response = createStrippedStream(
+      sseResponse([TOOL_EVENT], {
+        'content-encoding': 'gzip',
+        etag: '"stale"',
+      }),
+    )
+
+    expect(response.headers.get('content-encoding')).toBeNull()
+    expect(response.headers.get('etag')).toBeNull()
+  })
+
+  test('propagates an upstream stream error instead of truncating silently', async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"name":"mcp_Re'))
+        controller.error(new Error('upstream boom'))
+      },
+    })
+    const response = createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    )
+    await expect(readText(response)).rejects.toThrow('upstream boom')
+  })
+
+  test('propagates an upstream JSON stream error', async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"name":"mcp_Re'))
+        controller.error(new Error('JSON upstream boom'))
+      },
+    })
+    const response = createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    await expect(readText(response)).rejects.toThrow('JSON upstream boom')
+  })
+})
+
+describe('prefix round-trip', () => {
+  test('stripToolPrefix reverses prefixToolNames for lowercase tool names', () => {
+    const body = {
+      tools: [{ name: 'read' }, { name: 'write' }],
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'shell', input: {} }],
+        },
+      ],
+    }
+    const prefixed = prefixToolNames(structuredClone(body))
+    expect(prefixed).toContain('"name":"mcp_Read"')
+    expect(JSON.parse(stripToolPrefix(prefixed))).toEqual(body)
+  })
+
+  test('does not restore the original case for PascalCase tool names', () => {
+    const prefixed = prefixToolNames({ tools: [{ name: 'Read' }] })
+    // documented asymmetry: Read -> mcp_Read -> read
+    expect(JSON.parse(stripToolPrefix(prefixed)).tools[0].name).toBe('read')
+  })
+})
+
+describe('createStrippedStream - cancellation', () => {
+  test('forwards consumer cancellation to the upstream stream', async () => {
+    let cancelled = false
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(TOOL_EVENT))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const response = createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    )
+    const reader = response.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(cancelled).toBe(true)
+  })
+
+  test('buffers a chunk without a newline until flush', async () => {
+    const output = await readText(
+      createStrippedStream(sseResponse(['data: {"name":"mcp_Read"}'])),
+    )
+    expect(output).toBe('data: {"name": "read"}')
+  })
+
+  test('forwards JSON consumer cancellation to the upstream stream', async () => {
+    let cancelled = false
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"padding":"ready",'))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const response = createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const reader = response.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(cancelled).toBe(true)
+  })
+})
