@@ -1,14 +1,14 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
 import dedent from 'dedent'
 import {
   CLAUDE_CODE_IDENTITY,
-  CLAUDE_CODE_VERSION,
   OPENCODE_IDENTITY_PREFIX,
   REQUIRED_BETAS,
+  USER_AGENT,
 } from '../constants'
 import {
   createStrippedStream,
-  isInsecure,
+  isTrustedAnthropicUrl,
   mergeBetaHeaders,
   mergeHeaders,
   prefixToolNames,
@@ -119,7 +119,8 @@ describe('setOAuthHeaders', () => {
   test('sets user-agent', () => {
     const headers = new Headers()
     setOAuthHeaders(headers, 'token')
-    expect(headers.get('user-agent')).toContain('claude-cli')
+    expect(headers.get('user-agent')).toBe(USER_AGENT)
+    expect(headers.get('user-agent')).toBe('claude-cli/2.1.258 (external, cli)')
   })
 
   test('removes x-api-key', () => {
@@ -224,16 +225,6 @@ describe('stripToolPrefix', () => {
 })
 
 describe('rewriteUrl', () => {
-  const originalEnv = process.env.ANTHROPIC_BASE_URL
-
-  afterEach(() => {
-    if (originalEnv === undefined) {
-      delete process.env.ANTHROPIC_BASE_URL
-    } else {
-      process.env.ANTHROPIC_BASE_URL = originalEnv
-    }
-  })
-
   test('adds beta=true to /v1/messages URL string', () => {
     const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
     const url = new URL(input.toString())
@@ -269,67 +260,6 @@ describe('rewriteUrl', () => {
     expect(url.searchParams.has('beta')).toBe(false)
   })
 
-  test('overrides origin when ANTHROPIC_BASE_URL is set', () => {
-    process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080'
-    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
-    const url = new URL(input.toString())
-    expect(url.origin).toBe('http://localhost:8080')
-    expect(url.pathname).toBe('/v1/messages')
-  })
-
-  test('preserves beta=true when ANTHROPIC_BASE_URL is set', () => {
-    process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080'
-    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
-    const url = new URL(input.toString())
-    expect(url.searchParams.get('beta')).toBe('true')
-  })
-
-  test('preserves existing query params when ANTHROPIC_BASE_URL is set', () => {
-    process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080'
-    const { input } = rewriteUrl(
-      'https://api.anthropic.com/v1/messages?foo=bar',
-    )
-    const url = new URL(input.toString())
-    expect(url.origin).toBe('http://localhost:8080')
-    expect(url.searchParams.get('foo')).toBe('bar')
-  })
-
-  test('handles ANTHROPIC_BASE_URL with trailing slash', () => {
-    process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080/'
-    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
-    const url = new URL(input.toString())
-    expect(url.pathname).toBe('/v1/messages')
-    expect(url.origin).toBe('http://localhost:8080')
-  })
-
-  test('ignores invalid ANTHROPIC_BASE_URL', () => {
-    process.env.ANTHROPIC_BASE_URL = 'not-a-url'
-    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
-    const url = new URL(input.toString())
-    expect(url.origin).toBe('https://api.anthropic.com')
-  })
-
-  test('ignores empty ANTHROPIC_BASE_URL', () => {
-    process.env.ANTHROPIC_BASE_URL = ''
-    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
-    const url = new URL(input.toString())
-    expect(url.origin).toBe('https://api.anthropic.com')
-  })
-
-  test('rejects file: scheme in ANTHROPIC_BASE_URL', () => {
-    process.env.ANTHROPIC_BASE_URL = 'file:///etc/passwd'
-    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
-    const url = new URL(input.toString())
-    expect(url.origin).toBe('https://api.anthropic.com')
-  })
-
-  test('rejects ANTHROPIC_BASE_URL with embedded credentials', () => {
-    process.env.ANTHROPIC_BASE_URL = 'http://user:pass@localhost:8080'
-    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
-    const url = new URL(input.toString())
-    expect(url.origin).toBe('https://api.anthropic.com')
-  })
-
   test('returns original input when no URL changes are needed', () => {
     const original = 'https://api.anthropic.com/v1/complete'
     const { input } = rewriteUrl(original)
@@ -341,68 +271,29 @@ describe('rewriteUrl', () => {
     const { input } = rewriteUrl(request)
     expect(input).toBe(request)
   })
-
-  test('overrides origin for Request input when ANTHROPIC_BASE_URL is set', () => {
-    process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080'
-    const request = new Request('https://api.anthropic.com/v1/messages')
-    const { input } = rewriteUrl(request)
-    const url = new URL((input as Request).url)
-    expect(url.origin).toBe('http://localhost:8080')
-    expect(url.pathname).toBe('/v1/messages')
-  })
 })
 
-describe('isInsecure', () => {
-  const originalBaseUrl = process.env.ANTHROPIC_BASE_URL
-  const originalInsecure = process.env.ANTHROPIC_INSECURE
-
-  afterEach(() => {
-    if (originalBaseUrl === undefined) {
-      delete process.env.ANTHROPIC_BASE_URL
-    } else {
-      process.env.ANTHROPIC_BASE_URL = originalBaseUrl
-    }
-    if (originalInsecure === undefined) {
-      delete process.env.ANTHROPIC_INSECURE
-    } else {
-      process.env.ANTHROPIC_INSECURE = originalInsecure
-    }
+describe('isTrustedAnthropicUrl', () => {
+  test('accepts only the official HTTPS Anthropic API origin', () => {
+    expect(isTrustedAnthropicUrl('https://api.anthropic.com/v1/messages')).toBe(
+      true,
+    )
+    expect(
+      isTrustedAnthropicUrl('https://api.anthropic.com:443/v1/messages'),
+    ).toBe(true)
   })
 
-  test('returns false when neither env var is set', () => {
-    delete process.env.ANTHROPIC_BASE_URL
-    delete process.env.ANTHROPIC_INSECURE
-    expect(isInsecure()).toBe(false)
-  })
-
-  test('returns false when only ANTHROPIC_INSECURE is set (no base URL)', () => {
-    delete process.env.ANTHROPIC_BASE_URL
-    process.env.ANTHROPIC_INSECURE = '1'
-    expect(isInsecure()).toBe(false)
-  })
-
-  test('returns false when ANTHROPIC_BASE_URL is set but ANTHROPIC_INSECURE is not', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    delete process.env.ANTHROPIC_INSECURE
-    expect(isInsecure()).toBe(false)
-  })
-
-  test('returns true when both are set and ANTHROPIC_INSECURE is "1"', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    process.env.ANTHROPIC_INSECURE = '1'
-    expect(isInsecure()).toBe(true)
-  })
-
-  test('returns true when ANTHROPIC_INSECURE is "true"', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    process.env.ANTHROPIC_INSECURE = 'true'
-    expect(isInsecure()).toBe(true)
-  })
-
-  test('returns false for other ANTHROPIC_INSECURE values', () => {
-    process.env.ANTHROPIC_BASE_URL = 'https://proxy.local'
-    process.env.ANTHROPIC_INSECURE = 'yes'
-    expect(isInsecure()).toBe(false)
+  test.each([
+    'http://api.anthropic.com/v1/messages',
+    'https://api.anthropic.com.evil.test/v1/messages',
+    'https://localhost/v1/messages',
+    'http://127.0.0.1/v1/messages',
+    'http://169.254.169.254/latest/meta-data',
+    'https://[::1]/v1/messages',
+    'https://user:pass@api.anthropic.com/v1/messages',
+    'not-a-url',
+  ])('rejects untrusted URL %s', (url) => {
+    expect(isTrustedAnthropicUrl(url)).toBe(false)
   })
 })
 
@@ -423,12 +314,15 @@ describe('createStrippedStream', () => {
       },
     })
 
-    const original = new Response(stream, { status: 200 })
+    const original = new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })
     const stripped = createStrippedStream(original)
 
     const text = await stripped.text()
-    expect(text).toContain('"name": "bash"')
-    expect(text).toContain('"name": "read"')
+    expect(text).toContain('"name":"bash"')
+    expect(text).toContain('"name":"read"')
     expect(text).not.toContain('mcp_bash')
     expect(text).not.toContain('mcp_read')
   })
@@ -443,11 +337,76 @@ describe('createStrippedStream', () => {
     const original = new Response(stream, {
       status: 201,
       statusText: 'Created',
-      headers: { 'x-custom': 'value' },
+      headers: {
+        'content-type': 'text/event-stream',
+        'x-custom': 'value',
+      },
     })
 
     const stripped = createStrippedStream(original)
     expect(stripped.status).toBe(201)
+    expect(stripped.headers.get('x-custom')).toBe('value')
+  })
+
+  test('strips a tool prefix split across arbitrary stream chunks', async () => {
+    const chunks = [
+      'data: {"type":"content_block_start","content_block":{"type":"tool_use","na',
+      'me":"m',
+      'cp_B',
+      'ash"}}\n\n',
+    ]
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+
+    const text = await createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    ).text()
+
+    expect(text).toContain('"name":"bash"')
+    expect(text).not.toContain('mcp_')
+  })
+
+  test('preserves unicode when every input byte is a separate chunk', async () => {
+    const input =
+      'data: {"type":"content_block_start","text":"Привет 👋","content_block":{"type":"tool_use","name":"mcp_Read"}}\n\n'
+    const bytes = new TextEncoder().encode(input)
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const byte of bytes) controller.enqueue(Uint8Array.of(byte))
+        controller.close()
+      },
+    })
+
+    const text = await createStrippedStream(
+      new Response(stream, {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    ).text()
+
+    expect(text).toContain('Привет 👋')
+    expect(text).toContain('"name":"read"')
+    expect(text).not.toContain('�')
+  })
+
+  test('drops stale content-length after rewriting the response body', () => {
+    const original = new Response('data: {"name":"mcp_Read"}\n\n', {
+      headers: {
+        'content-type': 'text/event-stream',
+        'content-length': '999',
+        'x-custom': 'value',
+      },
+    })
+
+    const stripped = createStrippedStream(original)
+
+    expect(stripped.headers.get('content-length')).toBeNull()
     expect(stripped.headers.get('x-custom')).toBe('value')
   })
 
@@ -824,27 +783,6 @@ describe('rewriteRequestBody', () => {
 
     // User message is untouched
     expect(result.messages[0].content).toBe('hi')
-  })
-})
-
-describe('reported Claude Code version', () => {
-  // Anthropic gates model access on the version we report, and we report it
-  // twice: in the user-agent header and in the billing header's cc_version.
-  // If those ever disagree, one of them is stale and new models start failing
-  // with a 400 claude_code_version_too_old. Assert both against the constant.
-  test('user-agent and billing header both report CLAUDE_CODE_VERSION', () => {
-    const headers = new Headers()
-    setOAuthHeaders(headers, 'token')
-    expect(headers.get('user-agent')).toBe(
-      `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
-    )
-
-    const body = JSON.stringify({
-      messages: [{ role: 'user', content: 'hello world test message' }],
-    })
-    const billingHeader = JSON.parse(rewriteRequestBody(body)).system[0].text
-    // cc_version is `<version>.<3-char suffix>`, so match the version segment.
-    expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
   })
 })
 

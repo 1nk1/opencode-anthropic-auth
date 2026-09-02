@@ -1,116 +1,105 @@
-# OpenCode Anthropic Auth Plugin
+# @1nk1/opencode-anthropic-auth
 
-> [!WARNING]
-> This plugin comes with no guarantees. You might be banned for breaking the TOS, you might not be. I don't work at Anthropic, nor am I an attorney.
->
-> Use your best judgment and don't try to abuse the subscriptions. Plugins like oh-my-openagent are _known_ to trigger bans. Please be careful when using Ralph loops or insanely heavy usage patterns.
+Private OpenCode 2 plugin for using a Claude Pro/Max subscription through Anthropic OAuth.
 
-> [!IMPORTANT]
-> If you are seeing issues, please try to `rm -rf ~/.cache/opencode/packages/@ex-machina` and check your `opencode.json` config to make sure you're on the latest version.
->
-> Try this FIRST before making an Issue. Thanks!
+> **Compatibility:** OpenCode 2 beta only. Version `2.0.0-beta.5` targets
+> `opencode2 v0.0.0-beta-18743` and `@opencode-ai/plugin@0.0.0-beta-18743`.
+> Do not install it in OpenCode V1.
 
-An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
+This package is private and hosted in GitHub Packages. It contains no API keys,
+OAuth credentials, user-specific paths, or machine-specific configuration.
+Credentials are managed by OpenCode's integration store.
 
-## Usage
+## Authenticate to GitHub Packages
 
-Add the plugin to your OpenCode configuration:
+Create a GitHub token with `read:packages`, then configure npm/Bun without
+committing the token:
+
+```ini
+# ~/.npmrc
+@1nk1:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
+```
+
+Export the token in your shell or secret manager:
+
+```sh
+export GITHUB_PACKAGES_TOKEN='github-token-with-read-packages'
+```
+
+## Install in OpenCode 2
+
+```sh
+opencode2 plugin add @1nk1/opencode-anthropic-auth@2.0.0-beta.5
+opencode2 service restart
+opencode2 plugin list
+```
+
+The plugin list must contain:
+
+```text
+ink1.anthropic-auth (active)
+```
+
+Alternatively, add the pinned package to the V2 configuration:
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth"]
+  "plugins": ["@1nk1/opencode-anthropic-auth@2.0.0-beta.5"]
 }
 ```
 
-> [!TIP]
-> It is STRONGLY advised that you pin the plugin to a version. This will keep you from getting automatic updates; however, this will protect you from nefarious updates.
->
-> This holds true for ANY OpenCode plugin. If you do not pin them, OpenCode will automatically update them on startup. It's a massive vulnerability waiting to happen.
+## Connect Claude Pro/Max
 
-#### Example of pinned version
-
-```json
-{
-  "plugin": ["@ex-machina/opencode-anthropic-auth@1.8.2"]
-}
+```sh
+opencode2 auth login anthropic --method claude-max
 ```
 
-## Authentication Methods
+Complete the browser OAuth flow, then verify the connection:
 
-The plugin provides three authentication options:
-
-- **Claude Pro/Max** - OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
-    - run the `/connect` command, select `Anthropic (API key)` -> `Claude Pro/Max` and do OAuth
-- **Create an API Key** - OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
-- **Manually enter API Key** - Standard API key entry for users who already have one.
-
-## Configuration
-
-The plugin supports the following environment variables:
-
-| Variable                          | Description                                                                                                                                                                                 |
-|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
-| `ANTHROPIC_INSECURE`              | Set to `1` or `true` to skip TLS certificate verification. Only effective when `ANTHROPIC_BASE_URL` is also set.                                                                            |
-
-## How It Works
-
-For Claude Pro/Max authentication, the plugin:
-
-1. Initiates a PKCE OAuth flow against Anthropic's authorization endpoint
-2. Exchanges the authorization code for access and refresh tokens
-3. Automatically refreshes expired tokens
-4. Injects the required OAuth headers and beta flags into API requests
-5. Sanitizes the system prompt for compatibility (see below)
-6. Zeros out model costs (since usage is covered by the subscription)
-
-### System Prompt Sanitization
-
-The Anthropic API for Max subscriptions has specific requirements for the system prompt to identify as Claude Code. The plugin rewrites the system prompt on each request using an **anchor-based** approach that minimizes what gets changed:
-
-1. **Identity swap** — The OpenCode identity line is removed and replaced with the Claude Code identity.
-2. **Paragraph removal by anchor** — Any paragraph containing a known URL anchor (e.g. `github.com/anomalyco/opencode`, `opencode.ai/docs`) is removed entirely. This is resilient to upstream rewording — as long as the anchor URL appears somewhere in the paragraph, the removal works regardless of surrounding text changes.
-3. **Inline text replacements** — Short branded strings inside paragraphs we want to keep are replaced (e.g. "OpenCode" → "the assistant" in the professional objectivity section).
-
-Everything else in the system prompt is preserved: tone/style guidance, task management instructions, tool usage policy, environment info, skills, user/project instructions, and file paths containing "opencode". The sanitized system prompt is structured as three blocks in `system[]`: the billing header, the Claude Code identity line, and the remaining system content.
-
-## Development
-
-### Local Testing
-
-Use `bun run dev` to test plugin changes locally without publishing to npm:
-
-```bash
-bun run dev
+```sh
+opencode2 auth list
+opencode2 run --model anthropic/claude-opus-5 \
+  'Reply with exactly: OPUS_OAUTH_OK'
 ```
 
-This does three things:
+## What it does
 
-1. Builds the plugin
-2. Symlinks the build output into `.opencode/plugins/` so OpenCode loads it as a local plugin
-3. Starts `tsc --watch` for automatic rebuilds on source changes
+- registers a `Claude Pro/Max` OAuth method for the native Anthropic integration;
+- refreshes rotating OAuth credentials through OpenCode's integration lifecycle;
+- injects Anthropic OAuth and required beta headers;
+- adds the Claude Code billing envelope and sanitizes known OpenCode fingerprints;
+- prefixes request tool names and safely strips prefixes from streamed responses;
+- supports arbitrary network chunk boundaries and split UTF-8 code points;
+- removes stale `content-length` after response-body rewriting.
 
-After starting the dev script, restart OpenCode in this project directory to pick up the local build. Any edits to `src/` will trigger a rebuild — restart OpenCode again to load the new version.
+## Security
 
-Ctrl+C stops the watcher and cleans up the symlink. If the process was killed without cleanup (e.g. `kill -9`), you can manually remove the symlink:
+- Never commit GitHub package tokens or Anthropic credentials.
+- Pin both this package and OpenCode 2 because the plugin API is still beta.
+- OAuth credentials remain in OpenCode's managed integration store.
+- OAuth bearer tokens are sent only to `https://api.anthropic.com`; custom
+  Anthropic-compatible endpoints are intentionally unsupported.
 
-```bash
-bun run dev:clean
+## Development verification
+
+```sh
+bun install --frozen-lockfile
+bun test
+bun run types
+bun run lint
+bun run format:check
+bun run build
+npm pack --dry-run
 ```
 
-> [!NOTE]
-> If you have the npm version of this plugin in your global OpenCode config, both will load. The local version takes precedence for auth handling.
+The live model matrix is opt-in because it consumes subscription usage:
 
-### Publishing
-
-This project uses [changesets](https://github.com/changesets/changesets) for versioning and publishing. See the [changeset README](.changeset/README.md) for more details.
-
-```bash
-bun change          # create a changeset describing your changes
+```sh
+ANTHROPIC_LIVE_SMOKE=1 bun run test:live-models
 ```
 
-When changesets are merged to `main`, CI will automatically open a release PR. Merging that PR publishes to npm.
+## Attribution and license
 
-## License
-
-MIT
+Derived from `ex-machina-co/opencode-anthropic-auth` and distributed under the
+MIT License. See `LICENSE` and the upstream repository for attribution.

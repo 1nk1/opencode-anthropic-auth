@@ -1,40 +1,66 @@
 {
-  "name": "@ex-machina/opencode-anthropic-auth",
-  "version": "1.8.2",
+  "name": "@1nk1/opencode-anthropic-auth",
+  "version": "2.0.0-beta.5",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "1nk1",
+    "email": "andrey.pagosov@gmail.com"
+  },
+  "sideEffects": false,
+  "packageManager": "bun@1.4.0",
+  "keywords": [
+    "opencode",
+    "opencode2",
+    "anthropic",
+    "claude",
+    "oauth"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/ex-machina-co/opencode-anthropic-auth"
+    "url": "https://github.com/1nk1/opencode-anthropic-auth"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "restricted",
+    "registry": "https://npm.pkg.github.com",
+    "tag": "beta"
+  },
   "engines": {
-    "bun": "1.3.14"
+    "bun": ">=1.3.14"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "prepare": "tsc -p tsconfig.build.json",
+    "prepack": "bun run verify && bun run build && bun run scan:unicode-stego --require-text dist",
     "build": "tsc -p tsconfig.build.json",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "extract": "bun scripts/extract-system-prompt.ts",
     "test": "bun test",
+    "test:live-models": "bun scripts/live-model-smoke.ts",
     "types": "tsc",
     "format": "biome check --write --unsafe",
     "format:check": "biome format .",
     "lint": "biome lint .",
-    "change": "changeset",
-    "release": "bun run build && bun change publish"
+    "audit": "bun audit --audit-level=high",
+    "scan:unicode-stego": "bun scripts/scan-unicode-stego.ts",
+    "verify": "bun test && bun run types && bun run lint && bun run format:check && bun run audit && bun run scan:unicode-stego"
   },
-  "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+  "dependencies": {
+    "@opencode-ai/plugin": "0.0.0-beta-18743",
+    "@streamparser/json": "0.0.26"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
-    "@changesets/changelog-github": "^0.7.0",
-    "@changesets/cli": "^2.31.0",
-    "@opencode-ai/plugin": "1.17.13",
     "@tsconfig/bun": "1.0.10",
     "@types/bun": "1.3.14",
     "dedent": "^1.7.2",
