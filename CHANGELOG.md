@@ -1,5 +1,27 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.0.0-next.0
+
+### Major Changes
+
+- [#211](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/211) [`2d37ba5`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/2d37ba5a6f17acdf923540a906714e29ae40f373) Thanks [@CasualDeveloper](https://github.com/CasualDeveloper)! - Port the plugin to the OpenCode v2 plugin API ([#203](https://github.com/ex-machina-co/opencode-anthropic-auth/issues/203)). OpenCode v2 removed the v1 `auth` hook and provider `fetch` override that this plugin previously relied on, so this is a breaking change:
+
+  - The package now exports a v2 `Plugin.define({ id, setup })` default export instead of the v1 named `AnthropicAuthPlugin` function. **This release is no longer loadable by OpenCode v1** — pin to a `1.x` release if you're still on OpenCode v1.
+  - Claude Pro/Max OAuth is now registered through `ctx.integration.transform`, with token refresh wired into OpenCode v2's integration refresh lifecycle (still with a plugin-level single-flight guard to protect against concurrent refresh requests racing a rotating refresh token).
+  - Anthropic request/response rewriting (OAuth headers, beta flags, body/tool-name transforms, `ANTHROPIC_BASE_URL`) now runs through `ctx.session.hook('http.request' | 'http.response', ...)`, gated to native Anthropic requests using this plugin's OAuth connection.
+  - The "Create an API Key" console OAuth method (which minted and stored an Anthropic API key) is not included in this release — OpenCode v2's plugin API doesn't yet support an OAuth flow that ends in a stored API key. Manual API key entry and `ANTHROPIC_API_KEY` continue to work via OpenCode's built-in Anthropic integration.
+  - Anthropic models retain their API price display in OpenCode v2. The beta Promise API cannot cancel the event subscription needed to keep OAuth-dependent catalog costs synchronized safely.
+  - `ANTHROPIC_INSECURE` is not supported under OpenCode v2: request hooks can rewrite a `Request` but cannot disable TLS verification for it. The plugin now logs a warning instead of silently leaving it unapplied.
+  - `@opencode-ai/plugin` is a pinned production dependency on the `0.0.0-next-17444` prerelease that introduced the v2 promise plugin API used here.
+
+### Patch Changes
+
+- [#218](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/218) [`988d87c`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/988d87c93ef0a61d4833299ef87e846c895b2f0d) Thanks [@1nk1](https://github.com/1nk1)! - Handle CR-delimited SSE events and reject oversized newline-free stream lines.
+
+- [#230](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/230) [`ee40de9`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/ee40de927843a80fbb52f99a54c244ace4371cbe) Thanks [@eXamadeus](https://github.com/eXamadeus)! - Carry the reported Claude Code version bump (`2.1.87` → `2.1.258`) into the v2 release line. Anthropic gates model access on this value server-side, so newer models were rejected with a 400 `claude_code_version_too_old`: "Claude Code 2.1.87 does not support this model; version 2.1.251 or newer is required". `USER_AGENT` is derived from `CLAUDE_CODE_VERSION` instead of repeating the version in a second literal, so future bumps only need to change one constant.
+
+  The code already reached `v2/main`, but its original changeset was consumed by the v1.8.2 release on `main`, so this restates the release note for the v2 changelog.
+
 ## 1.8.2
 
 ### Patch Changes

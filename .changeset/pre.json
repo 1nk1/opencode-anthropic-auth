@@ -4,5 +4,9 @@
   "initialVersions": {
     "@ex-machina/opencode-anthropic-auth": "1.8.2"
   },
-  "changesets": []
+  "changesets": [
+    "calm-streams-flow",
+    "port-opencode-v2-plugin-api",
+    "quiet-moons-repeat"
+  ]
 }
