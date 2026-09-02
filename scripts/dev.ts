@@ -58,7 +58,9 @@ createSymlink()
 
 // 3. Start tsc --watch
 console.log('[dev] Starting tsc --watch...')
-console.log('[dev] Restart OpenCode to pick up the linked plugin.')
+console.log(
+  '[dev] Restart OpenCode v2 (opencode2) to pick up the linked plugin.',
+)
 const child = Bun.spawn(
   ['tsc', '-p', 'tsconfig.build.json', '--watch', '--preserveWatchOutput'],
   {
