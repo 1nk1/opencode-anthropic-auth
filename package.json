@@ -1,6 +1,6 @@
 {
   "name": "@1nk1/opencode-anthropic-auth",
-  "version": "2.0.0-beta.5",
+  "version": "2.0.0-beta.6",
   "type": "module",
   "license": "MIT",
   "author": {
@@ -56,7 +56,7 @@
     "verify": "bun test && bun run types && bun run lint && bun run format:check && bun run audit && bun run scan:unicode-stego"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "0.0.0-beta-18743",
+    "@opencode-ai/plugin": "0.0.0-beta-18866",
     "@streamparser/json": "0.0.26"
   },
   "devDependencies": {

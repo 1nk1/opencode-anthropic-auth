@@ -15,6 +15,7 @@ const MAX_UNSAFE_DEBUG_BYTES_PER_MODEL = 16 * 1024
 const MAX_CLEANUP_PAGES = 10
 const MAX_CLEANUP_SESSIONS = 256
 const INTERRUPTED_CLEANUP_TIMEOUT_MS = 5_000
+const PREFLIGHT_POLL_DELAY_MS = 50
 type ChildProcess = {
   pid: number
   exited: Promise<number>
@@ -90,6 +91,11 @@ type PrivateServer = {
   stop(): Promise<void>
 }
 
+type PreflightOutcome = {
+  preflight: PreflightResult
+  models?: string[]
+}
+
 function signalChild(child: ChildProcess, signal: NodeJS.Signals): void {
   if (process.platform !== 'win32') {
     try {
@@ -150,6 +156,45 @@ export function parseAnthropicModels(output: string): string[] {
     }
   }
   return models
+}
+
+export function parseAnthropicModelResponse(output: string): string[] {
+  const value: unknown = JSON.parse(output)
+  if (!isRecord(value) || !Array.isArray(value.data)) {
+    throw new Error('Invalid model list response')
+  }
+  if (value.data.length > MAX_LIVE_MODELS) {
+    throw new Error(
+      `OpenCode returned ${value.data.length} models; maximum is ${MAX_LIVE_MODELS}`,
+    )
+  }
+  const models = value.data
+    .map((item): string => {
+      if (
+        !isRecord(item) ||
+        typeof item.providerID !== 'string' ||
+        typeof item.modelID !== 'string'
+      ) {
+        throw new Error('Invalid model list response')
+      }
+      return item.providerID === INTEGRATION_ID
+        ? `${INTEGRATION_ID}/${item.modelID}`
+        : ''
+    })
+    .filter((model) => model !== '')
+  const unique = [...new Set(models)].sort()
+  if (unique.length === 0) {
+    throw new Error('OpenCode returned no Anthropic models')
+  }
+  const encoder = new TextEncoder()
+  for (const model of unique) {
+    if (encoder.encode(model).byteLength > MAX_MODEL_ID_BYTES) {
+      throw new Error(
+        `OpenCode returned an Anthropic model ID above the ${MAX_MODEL_ID_BYTES} byte limit`,
+      )
+    }
+  }
+  return unique
 }
 
 export function classifySmokeResult(result: CommandResult): SmokeStatus {
@@ -801,10 +846,17 @@ async function runPreflight(
   binary: string,
   sandbox: { directory: string; preflightPath: string; pluginPath: string },
   timeoutMs: number,
-): Promise<PreflightResult> {
+): Promise<PreflightOutcome> {
+  const deadline = Date.now() + timeoutMs
+  const remainingTimeout = (phase: string): number => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0)
+      throw new Error(`Preflight deadline exceeded during ${phase}`)
+    return remaining
+  }
   const configuredPlugin = process.env.ANTHROPIC_LIVE_PLUGIN?.trim()
   const configOverlay = JSON.stringify({
-    plugin: [
+    plugins: [
       ...(configuredPlugin ? [configuredPlugin] : []),
       pathToFileURL(dirname(sandbox.pluginPath)).href,
     ],
@@ -812,68 +864,103 @@ async function runPreflight(
   const server = await startPrivateServer(
     binary,
     sandbox.directory,
-    timeoutMs,
+    remainingTimeout('private server startup'),
     configOverlay,
   )
   try {
     const barrier = await runCommand(
       [binary, 'auth', 'list', '--server', server.url, '--format', 'json'],
       sandbox.directory,
-      timeoutMs,
+      remainingTimeout('auth-list barrier'),
       { OPENCODE_SERVER_PASSWORD: server.password },
     )
     if (isIncompleteCommand(barrier)) {
       throw new Error('Unable to initialize isolated OpenCode integrations')
     }
 
-    const command = await runCommand(
-      [binary, 'api', '--server', server.url, 'get', '/api/plugin'],
-      sandbox.directory,
-      timeoutMs,
-      { OPENCODE_SERVER_PASSWORD: server.password },
-    )
-    if (isIncompleteCommand(command)) {
-      throw new Error('Unable to inspect isolated OpenCode plugins')
-    }
+    let lastError = new Error('OpenCode preflight did not become ready')
+    while (true) {
+      throwIfInterrupted()
+      try {
+        const command = await runCommand(
+          [binary, 'api', '--server', server.url, 'get', '/api/plugin'],
+          sandbox.directory,
+          remainingTimeout('plugin readiness'),
+          { OPENCODE_SERVER_PASSWORD: server.password },
+        )
+        if (isIncompleteCommand(command)) {
+          throw new Error('Unable to inspect isolated OpenCode plugins')
+        }
+        if (!hasActivePlugin(command.stdout, PLUGIN_ID)) {
+          throw new Error(`Required plugin ${PLUGIN_ID} is not active`)
+        }
 
-    const integration = await runCommand(
-      [
-        binary,
-        'api',
-        '--server',
-        server.url,
-        'get',
-        `/api/integration/${INTEGRATION_ID}`,
-      ],
-      sandbox.directory,
-      timeoutMs,
-      { OPENCODE_SERVER_PASSWORD: server.password },
-    )
-    if (isIncompleteCommand(integration)) {
-      throw new Error('Unable to inspect isolated OpenCode integrations')
-    }
+        const integration = await runCommand(
+          [
+            binary,
+            'api',
+            '--server',
+            server.url,
+            'get',
+            `/api/integration/${INTEGRATION_ID}`,
+          ],
+          sandbox.directory,
+          remainingTimeout('integration readiness'),
+          { OPENCODE_SERVER_PASSWORD: server.password },
+        )
+        if (isIncompleteCommand(integration)) {
+          throw new Error('Unable to inspect isolated OpenCode integrations')
+        }
+        if (
+          !hasOAuthMethod(integration.stdout, INTEGRATION_ID, OAUTH_METHOD_ID)
+        ) {
+          throw new Error(
+            `Required Anthropic OAuth method ${OAUTH_METHOD_ID} is not registered`,
+          )
+        }
 
-    let value: unknown
-    try {
-      value = JSON.parse(await readBoundedUtf8File(sandbox.preflightPath))
-    } catch {
-      throw new Error('OpenCode preflight plugin did not produce a result')
+        let value: unknown
+        try {
+          value = JSON.parse(await readBoundedUtf8File(sandbox.preflightPath))
+        } catch (error) {
+          throw new Error(
+            `OpenCode preflight plugin result is not ready: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+        const result = {
+          ...parsePreflightResult(value),
+          pluginID: PLUGIN_ID,
+          pluginActive: true,
+          oauthMethodID: OAUTH_METHOD_ID,
+          oauthMethodRegistered: true,
+        }
+        assertSafePreflight(result)
+        if (process.env.ANTHROPIC_LIVE_PREFLIGHT_ONLY === '1') {
+          return { preflight: result }
+        }
+
+        const modelsCommand = await runCommand(
+          [binary, 'api', '--server', server.url, 'get', '/api/model'],
+          sandbox.directory,
+          remainingTimeout('model catalog readiness'),
+          { OPENCODE_SERVER_PASSWORD: server.password },
+        )
+        if (isIncompleteCommand(modelsCommand)) {
+          throw new Error('Unable to inspect isolated OpenCode model catalog')
+        }
+        return {
+          preflight: result,
+          models: parseAnthropicModelResponse(modelsCommand.stdout),
+        }
+      } catch (error) {
+        if (deadline - Date.now() <= 0) throw lastError
+        lastError = error instanceof Error ? error : new Error(String(error))
+      }
+
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw lastError
+      await interruptibleSleep(Math.min(PREFLIGHT_POLL_DELAY_MS, remaining))
     }
-    const pluginActive = hasActivePlugin(command.stdout, PLUGIN_ID)
-    const oauthMethodRegistered = hasOAuthMethod(
-      integration.stdout,
-      INTEGRATION_ID,
-      OAUTH_METHOD_ID,
-    )
-    const result = {
-      ...parsePreflightResult(value),
-      pluginID: pluginActive ? PLUGIN_ID : null,
-      pluginActive,
-      oauthMethodID: oauthMethodRegistered ? OAUTH_METHOD_ID : null,
-      oauthMethodRegistered,
-    }
-    assertSafePreflight(result)
-    return result
   } finally {
     await server.stop()
   }
@@ -885,7 +972,7 @@ export function livePluginEnvironment():
   const plugin = process.env.ANTHROPIC_LIVE_PLUGIN?.trim()
   if (!plugin) return undefined
   return {
-    OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugin: [plugin] }),
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({ plugins: [plugin] }),
   }
 }
 
@@ -918,28 +1005,15 @@ async function main() {
   try {
     sandbox = await createSmokeSandbox(cwd)
     throwIfInterrupted()
-    const preflight = await runPreflight(binary, sandbox, timeoutMs)
+    const outcome = await runPreflight(binary, sandbox, timeoutMs)
+    const preflight = outcome.preflight
     throwIfInterrupted()
     console.log(
       `Preflight passed: ${preflight.pluginID}, Anthropic OAuth ${preflight.activeMethodID}.`,
     )
     if (process.env.ANTHROPIC_LIVE_PREFLIGHT_ONLY === '1') return
-
-    const discovery = await runCommand(
-      [binary, 'models', '--standalone'],
-      sandbox.directory,
-      timeoutMs,
-      pluginEnvironment,
-    )
-    throwIfInterrupted()
-    if (isIncompleteCommand(discovery)) {
-      throw new Error('Unable to discover OpenCode models')
-    }
-
-    const models = parseAnthropicModels(discovery.stdout)
-    if (models.length === 0) {
-      throw new Error('OpenCode returned no anthropic/* models')
-    }
+    const models = outcome.models
+    if (!models) throw new Error('OpenCode model catalog was not discovered')
 
     console.log(
       `Discovered ${models.length} Anthropic models; running sequentially.`,

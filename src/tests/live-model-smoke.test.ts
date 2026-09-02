@@ -23,6 +23,7 @@ import {
   livePluginEnvironment,
   MAX_MODEL_ID_BYTES,
   MAX_PREFLIGHT_RESULT_BYTES,
+  parseAnthropicModelResponse,
   parseAnthropicModels,
   parseExactSessionIDs,
   parsePreflightResult,
@@ -95,6 +96,7 @@ if (command === 'serve') {
   console.log(JSON.stringify({ data: [{ id: 'ink1.anthropic-auth', state: { status: 'active' } }] }))
 } else if (command === 'api' && args.includes('/api/integration/anthropic')) {
   console.log(JSON.stringify({ data: { id: 'anthropic', methods: [{ id: 'claude-max', type: 'oauth' }] } }))
+} else if (command === 'api' && args.includes('/api/model')) { console.log(JSON.stringify({ data: [{ providerID: 'anthropic', modelID: 'fake-model' }] }))
 } else if (command === 'api' && args.some((arg) => arg.startsWith('/api/session'))) {
   writeFileSync(process.env.CLEANUP_MARKER, 'called')
   console.log(JSON.stringify({ data: [] }))
@@ -204,13 +206,13 @@ async function runFakeSmoke(
   const reportMarker = join(directory, 'report.json')
   const binary = await writeCommandScript(
     directory,
-    `import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+    `import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
  const args = process.argv.slice(2)
  const command = args[0]
  if (command === 'serve') { if (process.env.FORK_SERVER_HELPER) { const helper = Bun.spawn(['bun', '-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdout: 'inherit', stderr: 'inherit' }); writeFileSync(process.env.HELPER_MARKER, String(helper.pid)) }; writeFileSync(process.env.SERVER_MARKER, String(process.pid)); const startupMode = process.env.FAKE_STARTUP_MODE; if (startupMode === 'malformed') console.log('not a server URL'); else if (startupMode === 'non-loopback') console.log('server listening on http://0.0.0.0:42423'); else if (startupMode === 'timeout') {} else if (startupMode === 'overflow') process.stdout.write('x'.repeat(4097)); else console.log('server listening on http://127.0.0.1:42423'); process.on('SIGTERM', () => process.exit(0)); process.on('SIGINT', () => process.exit(0)); setInterval(() => {}, 1000) }
 else if (command === 'auth') { writeFileSync('preflight.json', JSON.stringify({ pluginID: null, pluginActive: false, oauthMethodID: null, oauthMethodRegistered: false, activeCredentialType: process.env.FAKE_MODE === 'api-key' ? 'key' : 'oauth', activeMethodID: process.env.FAKE_MODE === 'api-key' ? null : 'claude-max' })); console.log('[]') }
-else if (command === 'api' && args.includes('/api/plugin')) console.log(JSON.stringify({ data: [{ id: 'ink1.anthropic-auth', state: { status: process.env.FAKE_MODE === 'inactive' ? 'failed' : 'active' } }] }))
-else if (command === 'api' && args.includes('/api/integration/anthropic')) console.log(JSON.stringify({ data: { id: 'anthropic', methods: process.env.FAKE_MODE === 'missing-oauth' ? [{ id: 'key', type: 'key' }] : [{ id: 'claude-max', type: 'oauth' }] } }))
+ else if (command === 'api' && (args.includes('/api/plugin') || args.includes('/api/integration/anthropic'))) { const path = 'preflight-api-attempts'; const attempts = (existsSync(path) ? Number(readFileSync(path, 'utf8')) : 0) + 1; writeFileSync(path, String(attempts)); const delayed = process.env.FAKE_MODE === 'delayed' && attempts < 3; if (process.env.FAKE_MODE === 'delayed') { try { unlinkSync('preflight.json') } catch {} if (!delayed) writeFileSync('preflight.json', JSON.stringify({ pluginID: null, pluginActive: false, oauthMethodID: null, oauthMethodRegistered: false, activeCredentialType: 'oauth', activeMethodID: 'claude-max' })) } if (args.includes('/api/plugin')) console.log(JSON.stringify({ data: [{ id: 'ink1.anthropic-auth', state: { status: process.env.FAKE_MODE === 'inactive' || process.env.FAKE_MODE === 'never-ready' || delayed ? 'failed' : 'active' } }] })); else console.log(JSON.stringify({ data: { id: 'anthropic', methods: process.env.FAKE_MODE === 'missing-oauth' || process.env.FAKE_MODE === 'never-ready' || delayed ? [{ id: 'key', type: 'key' }] : [{ id: 'claude-max', type: 'oauth' }] } })) }
+ else if (command === 'api' && args.includes('/api/model')) { const path = 'catalog-attempts'; const attempts = (existsSync(path) ? Number(readFileSync(path, 'utf8')) : 0) + 1; writeFileSync(path, String(attempts)); if ((process.env.FAKE_MODE === 'catalog-delayed' && attempts < 3) || process.env.FAKE_MODE === 'catalog-empty') console.log(JSON.stringify({ data: [] })); else if (process.env.FAKE_MODE === 'catalog-malformed') console.log('{'); else if (process.env.FAKE_MODE === 'catalog-truncated') process.stdout.write(JSON.stringify({ data: [{ providerID: 'anthropic', modelID: 'fake' }] }) + 'x'.repeat(1024 * 1024 + 1)); else if (process.env.FAKE_MODE === 'catalog-oversized') console.log(JSON.stringify({ data: Array.from({ length: 257 }, (_, index) => ({ providerID: 'anthropic', modelID: 'fake-' + index })) })); else console.log(JSON.stringify({ data: [{ providerID: 'openai', modelID: 'gpt' }, { providerID: 'anthropic', modelID: 'fake-model' }, { providerID: 'anthropic', modelID: 'fake-model' }] })) }
  else if (command === 'api' && args.some((arg) => arg.startsWith('/api/session'))) { const path = args.find((arg) => arg.startsWith('/api/session')); if (args.includes('get')) { const title = new URL(path, 'http://localhost').searchParams.get('search'); writeFileSync(process.env.CLEANUP_MARKER, 'called'); writeFileSync(process.env.CLEANUP_TITLE_MARKER, title ?? ''); const runTitle = readFileSync(process.env.TITLE_MARKER, 'utf8'); console.log(JSON.stringify({ data: [{ id: 'ses_matching', title: runTitle }, { id: 'ses_unrelated', title: 'unrelated-session' }], cursor: { next: null } })) } else { const id = path.slice('/api/session/'.length); appendFileSync(process.env.DELETED_MARKER, id + '\\n'); console.log(JSON.stringify({ data: [] })) } }
 else if (command === 'models') { writeFileSync(process.env.MODEL_MARKER, 'called'); if (process.env.FAKE_TRUNCATED_MODELS) { process.on('SIGTERM', () => process.exit(0)); process.stdout.write('anthropic/fake-model\\n' + 'x'.repeat(1024 * 1024 + 1)); setInterval(() => {}, 1000) } else console.log(process.env.FAKE_DELAY ? 'anthropic/fake-model\\nanthropic/fake-model-2' : 'anthropic/fake-model') }
  else if (command === 'run') { writeFileSync(process.env.RUN_MARKER, 'called'); writeFileSync(process.env.TITLE_MARKER, args[args.indexOf('--title') + 1] ?? ''); if (process.env.FAKE_RUN_FAILED) { console.error('fake model failure'); process.exit(7) } else console.log('MODEL_SMOKE_OK') }
@@ -283,6 +285,40 @@ describe('live model discovery', () => {
     expect(() =>
       parseAnthropicModels(`anthropic/${'x'.repeat(MAX_MODEL_ID_BYTES)}`),
     ).toThrow(`Anthropic model ID above the ${MAX_MODEL_ID_BYTES} byte limit`)
+  })
+
+  test('parses the authenticated model API envelope', () => {
+    expect(
+      parseAnthropicModelResponse(
+        JSON.stringify({
+          location: {},
+          data: [
+            { providerID: 'openai', modelID: 'gpt' },
+            { providerID: 'anthropic', modelID: 'z' },
+            { providerID: 'anthropic', modelID: 'a' },
+            { providerID: 'anthropic', modelID: 'a' },
+          ],
+        }),
+      ),
+    ).toEqual(['anthropic/a', 'anthropic/z'])
+  })
+
+  test.each(['malformed', 'empty'])('rejects a %s model envelope', (kind) => {
+    const output = kind === 'empty' ? JSON.stringify({ data: [] }) : '{'
+    expect(() => parseAnthropicModelResponse(output)).toThrow()
+  })
+
+  test('rejects an oversized model catalog', () => {
+    expect(() =>
+      parseAnthropicModelResponse(
+        JSON.stringify({
+          data: Array.from({ length: 257 }, (_, index) => ({
+            providerID: 'anthropic',
+            modelID: `model-${index}`,
+          })),
+        }),
+      ),
+    ).toThrow('maximum is 256')
   })
 })
 
@@ -394,7 +430,7 @@ describe('live model preflight', () => {
       process.env.ANTHROPIC_LIVE_PLUGIN = 'file:///private/plugin'
       expect(livePluginEnvironment()).toEqual({
         OPENCODE_CONFIG_CONTENT: JSON.stringify({
-          plugin: ['file:///private/plugin'],
+          plugins: ['file:///private/plugin'],
         }),
       })
     } finally {
@@ -911,6 +947,78 @@ describe('live model fail-closed execution', () => {
     }
   })
 
+  test('polls until delayed plugin, integration, and result readiness', async () => {
+    const smoke = await runFakeSmoke('delayed', {
+      ANTHROPIC_LIVE_TIMEOUT_MS: '5000',
+    })
+    try {
+      expect(await smoke.child.exited).toBe(0)
+      await waitForFile(smoke.runMarker)
+      expect(
+        (await readdir(smoke.directory)).filter((entry) =>
+          entry.startsWith('.anthropic-live-smoke-'),
+        ),
+      ).toEqual([])
+    } finally {
+      await rm(smoke.directory, { recursive: true, force: true })
+    }
+  }, 8_000)
+
+  test('fails at the preflight deadline without process or sandbox leftovers', async () => {
+    const smoke = await runFakeSmoke('never-ready', {
+      ANTHROPIC_LIVE_TIMEOUT_MS: '100',
+    })
+    try {
+      expect(await smoke.child.exited).not.toBe(0)
+      const serverPID = Number(await readFile(smoke.serverMarker, 'utf8'))
+      expect(
+        Bun.spawnSync(['kill', '-0', String(serverPID)]).exitCode,
+      ).not.toBe(0)
+      await expect(access(smoke.modelMarker)).rejects.toThrow()
+      expect(
+        (await readdir(smoke.directory)).filter((entry) =>
+          entry.startsWith('.anthropic-live-smoke-'),
+        ),
+      ).toEqual([])
+    } finally {
+      await rm(smoke.directory, { recursive: true, force: true })
+    }
+  }, 8_000)
+
+  test('polls until the authenticated model catalog is ready', async () => {
+    const smoke = await runFakeSmoke('catalog-delayed', {
+      ANTHROPIC_LIVE_TIMEOUT_MS: '5000',
+    })
+    try {
+      expect(await smoke.child.exited).toBe(0)
+      await waitForFile(smoke.runMarker)
+    } finally {
+      await rm(smoke.directory, { recursive: true, force: true })
+    }
+  }, 8_000)
+
+  test.each([
+    'catalog-malformed',
+    'catalog-truncated',
+    'catalog-oversized',
+    'catalog-empty',
+  ])('rejects a %s catalog before running models', async (mode) => {
+    const smoke = await runFakeSmoke(mode, {
+      ANTHROPIC_LIVE_TIMEOUT_MS: '100',
+    })
+    try {
+      expect(await smoke.child.exited).not.toBe(0)
+      await expect(access(smoke.modelMarker)).rejects.toThrow()
+      expect(
+        (await readdir(smoke.directory)).filter((entry) =>
+          entry.startsWith('.anthropic-live-smoke-'),
+        ),
+      ).toEqual([])
+    } finally {
+      await rm(smoke.directory, { recursive: true, force: true })
+    }
+  })
+
   test('interrupting a huge inter-model delay exits and removes the sandbox', async () => {
     const smoke = await runFakeSmoke('valid', {
       FAKE_DELAY: '1',
@@ -960,10 +1068,8 @@ describe('live model fail-closed execution', () => {
     }
   }, 8_000)
 
-  test('does not run models from a truncated discovery response', async () => {
-    const smoke = await runFakeSmoke('valid', {
-      FAKE_TRUNCATED_MODELS: '1',
-    })
+  test('does not run models from a truncated catalog response', async () => {
+    const smoke = await runFakeSmoke('catalog-truncated', {})
     try {
       expect(await smoke.child.exited).not.toBe(0)
       await expect(access(smoke.runMarker)).rejects.toThrow()
