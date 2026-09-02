@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { buildBillingHeaderValue } from '../cch'
+import { CLAUDE_CODE_VERSION } from '../constants'
 import { AnthropicAuthPlugin } from '../index'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
@@ -13,6 +15,9 @@ function createMockClient() {
   return {
     auth: {
       set: mock(() => Promise.resolve()),
+    },
+    app: {
+      log: mock(() => Promise.resolve()),
     },
   }
 }
@@ -61,6 +66,22 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
     client: client ?? createMockClient(),
   })) as Promise<any>
 }
+
+// The plugin reads CLAUDE_CODE_VERSION at load time, so an ambient value in
+// the developer's shell would otherwise leak into every test in this file.
+const originalVersionEnv = process.env.CLAUDE_CODE_VERSION
+
+beforeEach(() => {
+  delete process.env.CLAUDE_CODE_VERSION
+})
+
+afterEach(() => {
+  if (originalVersionEnv === undefined) {
+    delete process.env.CLAUDE_CODE_VERSION
+  } else {
+    process.env.CLAUDE_CODE_VERSION = originalVersionEnv
+  }
+})
 
 describe('AnthropicAuthPlugin', () => {
   test('returns an object with auth properties', async () => {
@@ -607,5 +628,113 @@ describe('auth.loader', () => {
     })
 
     expect(capturedUrl).toContain('beta=true')
+  })
+})
+
+describe('reported Claude Code version', () => {
+  const originalFetch = globalThis.fetch
+  const USER_MESSAGE = 'hello world test message'
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  /**
+   * Drive one OAuth request through the plugin and return the two places the
+   * Claude Code version is reported to Anthropic.
+   */
+  async function captureReportedVersion(
+    client: ReturnType<typeof createMockClient>,
+  ) {
+    let capturedHeaders: Headers | undefined
+    let capturedBody: string | undefined
+
+    globalThis.fetch = mock((_input: any, init: any) => {
+      capturedHeaders = init?.headers
+      capturedBody = init?.body
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(client)
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth',
+          access: 'token',
+          refresh: 'refresh',
+          expires: Date.now() + 100000,
+        }),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, {
+      method: 'POST',
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: USER_MESSAGE }],
+      }),
+    })
+
+    return {
+      userAgent: capturedHeaders!.get('user-agent'),
+      billingHeader: JSON.parse(capturedBody!).system[0].text as string,
+    }
+  }
+
+  test('reports the bundled version when the override is unset', async () => {
+    const { userAgent, billingHeader } = await captureReportedVersion(
+      createMockClient(),
+    )
+
+    expect(userAgent).toBe(`claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`)
+    expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
+  })
+
+  test('reports a valid override in both the user-agent and billing header', async () => {
+    process.env.CLAUDE_CODE_VERSION = '  2.9.99  '
+
+    const { userAgent, billingHeader } = await captureReportedVersion(
+      createMockClient(),
+    )
+
+    expect(userAgent).toBe('claude-cli/2.9.99 (external, cli)')
+    // The billing suffix is derived from the override, not the bundled version.
+    expect(billingHeader).toBe(
+      buildBillingHeaderValue(
+        [{ role: 'user', content: USER_MESSAGE }],
+        '2.9.99',
+        'sdk-cli',
+      ),
+    )
+  })
+
+  test('logs and falls back to the bundled version for a malformed override', async () => {
+    process.env.CLAUDE_CODE_VERSION = 'latest'
+    const client = createMockClient()
+
+    const { userAgent, billingHeader } = await captureReportedVersion(client)
+
+    expect(client.app.log).toHaveBeenCalledTimes(1)
+    const logged = (client.app.log as unknown as ReturnType<typeof mock>).mock
+      .calls[0]![0] as {
+      body: { level: string; message: string }
+    }
+    expect(logged.body.level).toBe('error')
+    expect(logged.body.message).toContain('CLAUDE_CODE_VERSION')
+    expect(logged.body.message).toContain('major.minor.patch')
+
+    // Falling back keeps both reported values valid and in agreement.
+    expect(userAgent).toBe(`claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`)
+    expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
+  })
+
+  test('loads without throwing when the client cannot log', async () => {
+    process.env.CLAUDE_CODE_VERSION = 'latest'
+
+    const plugin = await AnthropicAuthPlugin({
+      // @ts-expect-error: client without app.log, as in older OpenCode builds
+      client: { auth: { set: mock(() => Promise.resolve()) } },
+    })
+
+    expect((plugin as any).auth.provider).toBe('anthropic')
   })
 })

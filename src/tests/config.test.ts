@@ -1,0 +1,73 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import {
+  CLAUDE_CODE_VERSION_ENV_VAR,
+  resolveClaudeCodeVersion,
+} from '../config'
+import { CLAUDE_CODE_VERSION } from '../constants'
+
+describe('resolveClaudeCodeVersion', () => {
+  const originalEnv = process.env[CLAUDE_CODE_VERSION_ENV_VAR]
+
+  beforeEach(() => {
+    delete process.env[CLAUDE_CODE_VERSION_ENV_VAR]
+  })
+
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env[CLAUDE_CODE_VERSION_ENV_VAR]
+    } else {
+      process.env[CLAUDE_CODE_VERSION_ENV_VAR] = originalEnv
+    }
+  })
+
+  test('falls back to the bundled version when unset', () => {
+    expect(resolveClaudeCodeVersion()).toEqual({
+      type: 'success',
+      version: CLAUDE_CODE_VERSION,
+    })
+  })
+
+  test('reads the override from the environment', () => {
+    process.env[CLAUDE_CODE_VERSION_ENV_VAR] = '2.9.99'
+    expect(resolveClaudeCodeVersion()).toEqual({
+      type: 'success',
+      version: '2.9.99',
+    })
+  })
+
+  test('trims surrounding whitespace from a valid override', () => {
+    expect(resolveClaudeCodeVersion('  2.9.99\n')).toEqual({
+      type: 'success',
+      version: '2.9.99',
+    })
+  })
+
+  test.each([
+    ['empty', ''],
+    ['whitespace only', '   '],
+    ['two components', '2.9'],
+    ['four components', '2.9.99.1'],
+    ['prerelease suffix', '2.9.99-beta.1'],
+    ['v prefix', 'v2.9.99'],
+    ['non-numeric component', '2.x.99'],
+    ['not a version', 'latest'],
+  ])('rejects a malformed override (%s)', (_label, raw) => {
+    const result = resolveClaudeCodeVersion(raw)
+    expect(result.type).toBe('invalid')
+    if (result.type === 'invalid') {
+      // The message has to be actionable on its own: it is the only thing the
+      // user sees in the server log.
+      expect(result.error).toContain(CLAUDE_CODE_VERSION_ENV_VAR)
+      expect(result.error).toContain('major.minor.patch')
+      expect(result.error).toContain(CLAUDE_CODE_VERSION)
+    }
+  })
+
+  test('never throws on malformed input', () => {
+    expect(() => resolveClaudeCodeVersion('nonsense')).not.toThrow()
+  })
+
+  test('does not expose a version on the invalid arm', () => {
+    expect(resolveClaudeCodeVersion('nonsense')).not.toHaveProperty('version')
+  })
+})
