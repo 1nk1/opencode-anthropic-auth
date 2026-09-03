@@ -22,6 +22,12 @@
 
   The code already reached `v2/main`, but its original changeset was consumed by the v1.8.2 release on `main`, so this restates the release note for the v2 changelog.
 
+## 1.8.3
+
+### Patch Changes
+
+- [#218](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/218) [`988d87c`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/988d87c93ef0a61d4833299ef87e846c895b2f0d) Thanks [@1nk1](https://github.com/1nk1)! - Handle CR-delimited SSE events and reject oversized newline-free stream lines.
+
 ## 1.8.2
 
 ### Patch Changes

@@ -75,14 +75,20 @@ export default Plugin.define({
   id: PLUGIN_ID,
   setup: async (ctx) => {
     warnIfInsecureUnsupported()
+    // Resolved once per plugin instance so every request reports the same
+    // version in both the user-agent and the billing header.
     const versionResolution = resolveClaudeCodeVersion()
     if (versionResolution.type === 'invalid') {
       console.error(`[ex-machina.anthropic-auth] ${versionResolution.error}`)
+    } else if (versionResolution.type === 'outdated') {
+      console.warn(`[ex-machina.anthropic-auth] ${versionResolution.warning}`)
     }
+    // Only a malformed override lacks a usable version; an outdated one was
+    // set deliberately, so it is reported as configured.
     const claudeCodeVersion =
-      versionResolution.type === 'success'
-        ? versionResolution.version
-        : CLAUDE_CODE_VERSION
+      versionResolution.type === 'invalid'
+        ? CLAUDE_CODE_VERSION
+        : versionResolution.version
 
     // Retain successful refreshes for this plugin generation so a host call
     // holding the rotated token cannot submit it again before persistence.

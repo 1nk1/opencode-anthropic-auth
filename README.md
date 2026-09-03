@@ -15,6 +15,9 @@
 
 An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
 
+> [!NOTE]
+> This repository uses [Agent Facets](https://agentfacets.io) to manage agent capabilities. See the [quickstart](https://docs.agentfacets.io/quickstart) to install the CLI and get started.
+
 ## Version support
 
 | OpenCode version | Plugin release | Support branch | npm dist-tag | Configuration key |
@@ -30,6 +33,34 @@ Both release lines use the same npm package. They are not cross-compatible: the 
 > Pin an exact plugin version for a stable setup that changes only when you choose to upgrade. If you intentionally want automatic updates, use the moving npm tag for your OpenCode release line.
 >
 > This applies to every OpenCode plugin: an unpinned or moving-tag dependency can install new code on startup, so only track automatic updates from publishers you trust.
+
+### OpenCode v1 (`latest`)
+
+OpenCode v1 uses the singular `plugin` configuration key. A bare package spec tracks npm's `latest` tag:
+
+```json
+{
+  "plugin": ["@ex-machina/opencode-anthropic-auth"]
+}
+```
+
+You can also write the moving tag explicitly as `@ex-machina/opencode-anthropic-auth@latest`.
+
+For a stable setup, look up the exact version currently published on `latest`:
+
+```bash
+npm view @ex-machina/opencode-anthropic-auth dist-tags.latest
+```
+
+Substitute the command output for `<version>`:
+
+```json
+{
+  "plugin": ["@ex-machina/opencode-anthropic-auth@<version>"]
+}
+```
+
+### OpenCode v2 (`next`)
 
 OpenCode v2 uses the plural `plugins` configuration key. Because npm's default tag points to the v1 line, specify `@next` if you want to track the newest v2 prerelease:
 
@@ -55,36 +86,52 @@ Substitute the command output for `<version>`:
 
 ## Authentication Methods
 
-- **Claude Pro/Max** - OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
-    - run the `/connect` command, select `Anthropic` -> `Claude Pro/Max` and do OAuth
-- **Manually enter API Key / `ANTHROPIC_API_KEY`** - Handled by OpenCode's built-in Anthropic integration, not by this plugin.
+### OpenCode v1
+
+OpenCode v1 provides three authentication options:
+
+- **Claude Pro/Max** — OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
+    - Run `/connect`, select `Anthropic (API key)` -> `Claude Pro/Max`, and complete OAuth.
+- **Create an API Key** — OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
+- **Manually enter API Key** — Standard API-key entry for users who already have one.
+
+### OpenCode v2
+
+OpenCode v2 provides:
+
+- **Claude Pro/Max** — OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
+    - Run `/connect`, select `Anthropic` -> `Claude Pro/Max`, and complete OAuth.
+- **Manually enter API Key / `ANTHROPIC_API_KEY`** — Handled by OpenCode's built-in Anthropic integration, not by this plugin.
 
 > [!NOTE]
-> The v1 release of this plugin also offered a "Create an API Key" OAuth flow (via `console.anthropic.com`) that minted and stored an API key for you. OpenCode v2's plugin API does not yet support an OAuth authorization flow that ends in a stored API key, so that flow isn't available in this v2 release. Use manual API key entry (or `ANTHROPIC_API_KEY`) in the meantime — see [issue #203](https://github.com/ex-machina-co/opencode-anthropic-auth/issues/203) for status.
->
-> OpenCode v2 continues to display Anthropic's API prices for these models even though requests authenticated through Claude Pro/Max use the subscription. Dynamic cost display is deferred until the beta plugin API can safely cancel the required connection event subscription.
+> OpenCode v1 also offers a "Create an API Key" OAuth flow that mints and stores an API key. OpenCode v2's plugin API cannot yet complete an OAuth flow by storing a generated API key, so that option is unavailable in v2. Use manual API-key entry or `ANTHROPIC_API_KEY` in the meantime; see [issue #203](https://github.com/ex-machina-co/opencode-anthropic-auth/issues/203) for status.
 
 ## Configuration
 
-The plugin supports the following environment variables:
+The plugin reads the following environment variables:
 
-| Variable                          | Description                                                                                                                                                                                 |
-|-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
-| `ANTHROPIC_INSECURE`              | **Not supported under OpenCode v2.** OpenCode v2 plugin request hooks can rewrite a request but cannot disable TLS verification for it. If this is set, the plugin logs a warning and leaves TLS verification enabled — requests to a self-signed/untrusted `ANTHROPIC_BASE_URL` will fail. |
-| `CLAUDE_CODE_VERSION`             | Override the Claude Code version reported to Anthropic. Must be `major.minor.patch` (for example, `2.1.258`). Defaults to the bundled version; a malformed value is logged and ignored. |
+- **`ANTHROPIC_BASE_URL`** — Overrides the Anthropic API endpoint for both release lines, such as when using a proxy. Must be a valid HTTP(S) URL.
+- **`ANTHROPIC_INSECURE`** — Skips TLS certificate verification. Behavior differs by OpenCode version:
+    - **OpenCode v1** — Set to `1` or `true` to skip verification. Only effective when `ANTHROPIC_BASE_URL` is also set.
+    - **OpenCode v2** — Not supported. OpenCode v2 plugin request hooks cannot disable TLS verification. If set, the plugin logs a warning and leaves verification enabled; requests to an untrusted or self-signed `ANTHROPIC_BASE_URL` will fail.
+- **`ANTHROPIC_CLAUDE_CODE_VERSION`** — Overrides the Claude Code version reported to Anthropic for both release lines. Must be `major.minor.patch` (for example, `2.1.258`). Defaults to the bundled version; a malformed value is logged and the bundled version is used instead. A value older than the bundled version is honored but logs a warning, since reporting an older version can make newer models reject the request. Read once when the plugin loads, so restart OpenCode after changing it.
 
-Anthropic gates model access on the reported Claude Code version. `CLAUDE_CODE_VERSION` lets you raise it without waiting for a plugin release. The value is read when the plugin loads, so restart OpenCode after changing it.
+Anthropic gates model access on the reported Claude Code version server-side, returning a 400 `claude_code_version_too_old` error for models that require a newer client. `ANTHROPIC_CLAUDE_CODE_VERSION` lets you raise the reported version without waiting for a plugin release.
 
 ## How It Works
 
-For Claude Pro/Max authentication, the plugin:
+For Claude Pro/Max authentication, both release lines:
 
-1. Initiates a PKCE OAuth flow against Anthropic's authorization endpoint
-2. Exchanges the authorization code for access and refresh tokens
-3. Automatically refreshes expired tokens
-4. Injects the required OAuth headers and beta flags into API requests
-5. Sanitizes the system prompt for compatibility (see below)
+1. Initiate a PKCE OAuth flow against Anthropic's authorization endpoint
+2. Exchange the authorization code for access and refresh tokens
+3. Automatically refresh expired tokens
+4. Inject the required OAuth headers and beta flags into API requests
+5. Sanitize the system prompt for compatibility (see below)
+
+Model-cost display differs by OpenCode version:
+
+- **OpenCode v1** — The plugin zeros out displayed model costs because usage is covered by the subscription.
+- **OpenCode v2** — OpenCode continues to display Anthropic's API prices even though requests authenticated through Claude Pro/Max use the subscription. Dynamic cost display is deferred until the beta plugin API can safely cancel the required connection event subscription.
 
 ### System Prompt Sanitization
 
@@ -97,14 +144,6 @@ The Anthropic API for Max subscriptions has specific requirements for the system
 Everything else in the system prompt is preserved: tone/style guidance, task management instructions, tool usage policy, environment info, skills, user/project instructions, and file paths containing "opencode". The sanitized system prompt is structured as three blocks in `system[]`: the billing header, the Claude Code identity line, and the remaining system content.
 
 ## Development
-
-Verify the package tarball and its exported v2 plugin before publishing:
-
-```bash
-bun run check:package
-```
-
-This builds the plugin, packs it in a temporary directory, checks the package contents, imports the extracted entrypoint, and verifies that setup registers the Claude Pro/Max OAuth method. It does not use credentials or make model requests.
 
 ### Local Testing
 
@@ -120,9 +159,14 @@ This does three things:
 2. Symlinks the build output into `.opencode/plugins/` so OpenCode loads it as a local plugin
 3. Starts `tsc --watch` for automatic rebuilds on source changes
 
-After starting the dev script, restart OpenCode v2 (`opencode2`) in this project directory to pick up the local build. Any edits to `src/` will trigger a rebuild — restart OpenCode again to load the new version.
+After starting the dev script:
 
-You can confirm the plugin loaded correctly via the OpenCode v2 API:
+- On the `main` branch, restart OpenCode in this project directory.
+- On the `v2/main` branch, restart OpenCode v2 (`opencode2`) in this project directory.
+
+Edits to `src/` trigger a rebuild; restart the corresponding OpenCode version again to load the new build.
+
+You can confirm that the v2 plugin loaded through the OpenCode v2 API:
 
 ```bash
 opencode2 api get /api/plugin        # should list "ex-machina.anthropic-auth"
@@ -146,9 +190,12 @@ This project uses [changesets](https://github.com/changesets/changesets) for ver
 bun change          # create a changeset describing your changes
 ```
 
-Changesets merged to a release branch cause CI to open a release PR; merging that PR publishes to npm. This repository runs two release trains — `main` publishes the v1 line to npm's `latest`, and `v2/main` publishes the v2 line to `next` as `2.x.y-next.N` prereleases.
+Changesets merged to a release branch cause CI to open a release PR; merging that PR publishes to npm. The repository has two release trains:
 
-Maintainers: see [RELEASING.md](RELEASING.md) for the full runbook, including how `main` is synced into `v2/main`.
+- `main` publishes plugin v1 for OpenCode v1 to npm's `latest` tag.
+- `v2/main` publishes plugin v2 prereleases for OpenCode v2 to npm's `next` tag.
+
+Maintainers can find the complete two-train release and branch-sync process in the [release runbook](https://github.com/ex-machina-co/opencode-anthropic-auth/blob/v2/main/RELEASING.md).
 
 ## License
 
