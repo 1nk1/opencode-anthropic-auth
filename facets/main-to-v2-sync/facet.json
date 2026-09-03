@@ -1,0 +1,22 @@
+{
+  "name": "main-to-v2-sync",
+  "version": "0.1.0",
+  "description": "Run the repository's main to v2/main synchronization workflow as a VIPER plan",
+  "private": true,
+  "skills": {
+    "sync-main-to-v2": {
+      "description": "Load BEFORE running the main to v2/main forward-port; materializes and executes the bundled main-to-v2-sync VIPER plan",
+      "files": [
+        "references/plan.md"
+      ]
+    }
+  },
+  "commands": {
+    "sync-main": {
+      "description": "Prepare a verified local v2/sync/main branch that merges main into v2/main"
+    }
+  },
+  "files": [
+    "README.md"
+  ]
+}
