@@ -3,8 +3,8 @@
   "globalDependencies": ["bun.lock", "mise.toml"],
   "globalPassThroughEnv": [
     "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_INSECURE",
-    "CLAUDE_CODE_VERSION"
+    "ANTHROPIC_CLAUDE_CODE_VERSION",
+    "ANTHROPIC_INSECURE"
   ],
   "tasks": {
     "check:all": {

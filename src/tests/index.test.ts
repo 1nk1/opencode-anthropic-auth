@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { buildBillingHeaderValue } from '../cch'
+import { ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR } from '../config'
 import { CLAUDE_CODE_VERSION } from '../constants'
 import { AnthropicAuthPlugin } from '../index'
 
@@ -67,19 +68,20 @@ async function getPlugin(client?: ReturnType<typeof createMockClient>) {
   })) as Promise<any>
 }
 
-// The plugin reads CLAUDE_CODE_VERSION at load time, so an ambient value in
-// the developer's shell would otherwise leak into every test in this file.
-const originalVersionEnv = process.env.CLAUDE_CODE_VERSION
+// The plugin reads ANTHROPIC_CLAUDE_CODE_VERSION at load time, so an ambient
+// value in the developer's shell would otherwise leak into every test in this
+// file.
+const originalVersionEnv = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
 
 beforeEach(() => {
-  delete process.env.CLAUDE_CODE_VERSION
+  delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
 })
 
 afterEach(() => {
   if (originalVersionEnv === undefined) {
-    delete process.env.CLAUDE_CODE_VERSION
+    delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
   } else {
-    process.env.CLAUDE_CODE_VERSION = originalVersionEnv
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = originalVersionEnv
   }
 })
 
@@ -690,7 +692,7 @@ describe('reported Claude Code version', () => {
   })
 
   test('reports a valid override in both the user-agent and billing header', async () => {
-    process.env.CLAUDE_CODE_VERSION = '  2.9.99  '
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '  2.9.99  '
 
     const { userAgent, billingHeader } = await captureReportedVersion(
       createMockClient(),
@@ -708,7 +710,7 @@ describe('reported Claude Code version', () => {
   })
 
   test('logs and falls back to the bundled version for a malformed override', async () => {
-    process.env.CLAUDE_CODE_VERSION = 'latest'
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = 'latest'
     const client = createMockClient()
 
     const { userAgent, billingHeader } = await captureReportedVersion(client)
@@ -719,7 +721,7 @@ describe('reported Claude Code version', () => {
       body: { level: string; message: string }
     }
     expect(logged.body.level).toBe('error')
-    expect(logged.body.message).toContain('CLAUDE_CODE_VERSION')
+    expect(logged.body.message).toContain(ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR)
     expect(logged.body.message).toContain('major.minor.patch')
 
     // Falling back keeps both reported values valid and in agreement.
@@ -728,7 +730,7 @@ describe('reported Claude Code version', () => {
   })
 
   test('loads without throwing when the client cannot log', async () => {
-    process.env.CLAUDE_CODE_VERSION = 'latest'
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = 'latest'
 
     const plugin = await AnthropicAuthPlugin({
       // @ts-expect-error: client without app.log, as in older OpenCode builds

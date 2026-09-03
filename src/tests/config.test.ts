@@ -1,22 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
-  CLAUDE_CODE_VERSION_ENV_VAR,
+  ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR,
   resolveClaudeCodeVersion,
 } from '../config'
 import { CLAUDE_CODE_VERSION } from '../constants'
 
 describe('resolveClaudeCodeVersion', () => {
-  const originalEnv = process.env[CLAUDE_CODE_VERSION_ENV_VAR]
+  const originalEnv = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
 
   beforeEach(() => {
-    delete process.env[CLAUDE_CODE_VERSION_ENV_VAR]
+    delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
   })
 
   afterEach(() => {
     if (originalEnv === undefined) {
-      delete process.env[CLAUDE_CODE_VERSION_ENV_VAR]
+      delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
     } else {
-      process.env[CLAUDE_CODE_VERSION_ENV_VAR] = originalEnv
+      process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = originalEnv
     }
   })
 
@@ -28,7 +28,7 @@ describe('resolveClaudeCodeVersion', () => {
   })
 
   test('reads the override from the environment', () => {
-    process.env[CLAUDE_CODE_VERSION_ENV_VAR] = '2.9.99'
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '2.9.99'
     expect(resolveClaudeCodeVersion()).toEqual({
       type: 'success',
       version: '2.9.99',
@@ -57,7 +57,7 @@ describe('resolveClaudeCodeVersion', () => {
     if (result.type === 'invalid') {
       // The message has to be actionable on its own: it is the only thing the
       // user sees in the server log.
-      expect(result.error).toContain(CLAUDE_CODE_VERSION_ENV_VAR)
+      expect(result.error).toContain(ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR)
       expect(result.error).toContain('major.minor.patch')
       expect(result.error).toContain(CLAUDE_CODE_VERSION)
     }
