@@ -42,6 +42,39 @@ describe('resolveClaudeCodeVersion', () => {
     })
   })
 
+  // Fixtures are written relative to the bundled version, so a bundled bump
+  // that changes their ordering is meant to fail loudly here.
+  test.each([
+    ['lower major', '1.9.999'],
+    ['lower minor', '2.0.999'],
+    ['lower patch', '2.1.257'],
+    ['lower patch that sorts higher lexically', '2.1.99'],
+    ['lower version padded with leading zeros', '02.1.257'],
+  ])('flags an outdated override (%s)', (_label, raw) => {
+    const result = resolveClaudeCodeVersion(raw)
+    expect(result.type).toBe('outdated')
+    if (result.type === 'outdated') {
+      // An outdated override was still set deliberately, so it stays usable.
+      expect(result.version).toBe(raw)
+      expect(result.warning).toContain(ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR)
+      expect(result.warning).toContain(raw)
+      expect(result.warning).toContain(CLAUDE_CODE_VERSION)
+    }
+  })
+
+  test.each([
+    ['equal to the bundled version', CLAUDE_CODE_VERSION],
+    ['higher patch', '2.1.259'],
+    ['higher minor', '2.2.0'],
+    ['higher major that sorts lower lexically', '10.0.0'],
+    ['component beyond Number.MAX_SAFE_INTEGER', '9007199254740993.0.0'],
+  ])('accepts an override that is not outdated (%s)', (_label, raw) => {
+    expect(resolveClaudeCodeVersion(raw)).toEqual({
+      type: 'success',
+      version: raw,
+    })
+  })
+
   test.each([
     ['empty', ''],
     ['whitespace only', '   '],

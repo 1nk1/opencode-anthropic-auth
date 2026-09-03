@@ -682,6 +682,13 @@ describe('reported Claude Code version', () => {
     }
   }
 
+  /** Read the single startup log call the plugin made about the override. */
+  function readSingleLog(client: ReturnType<typeof createMockClient>) {
+    expect(client.app.log).toHaveBeenCalledTimes(1)
+    return (client.app.log as unknown as ReturnType<typeof mock>).mock
+      .calls[0]![0] as { body: { level: string; message: string } }
+  }
+
   test('reports the bundled version when the override is unset', async () => {
     const { userAgent, billingHeader } = await captureReportedVersion(
       createMockClient(),
@@ -715,11 +722,7 @@ describe('reported Claude Code version', () => {
 
     const { userAgent, billingHeader } = await captureReportedVersion(client)
 
-    expect(client.app.log).toHaveBeenCalledTimes(1)
-    const logged = (client.app.log as unknown as ReturnType<typeof mock>).mock
-      .calls[0]![0] as {
-      body: { level: string; message: string }
-    }
+    const logged = readSingleLog(client)
     expect(logged.body.level).toBe('error')
     expect(logged.body.message).toContain(ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR)
     expect(logged.body.message).toContain('major.minor.patch')
@@ -727,6 +730,32 @@ describe('reported Claude Code version', () => {
     // Falling back keeps both reported values valid and in agreement.
     expect(userAgent).toBe(`claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`)
     expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
+  })
+
+  test('warns but still reports an override older than the bundled version', async () => {
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '2.1.257'
+    const client = createMockClient()
+
+    const { userAgent, billingHeader } = await captureReportedVersion(client)
+
+    const logged = readSingleLog(client)
+    expect(logged.body.level).toBe('warn')
+    expect(logged.body.message).toContain(ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR)
+    expect(logged.body.message).toContain(CLAUDE_CODE_VERSION)
+
+    // Warning it is not the same as ignoring it: the explicit override still
+    // reaches both reported places.
+    expect(userAgent).toBe('claude-cli/2.1.257 (external, cli)')
+    expect(billingHeader).toContain('cc_version=2.1.257.')
+  })
+
+  test('stays silent for an override at or above the bundled version', async () => {
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = CLAUDE_CODE_VERSION
+    const client = createMockClient()
+
+    await captureReportedVersion(client)
+
+    expect(client.app.log).not.toHaveBeenCalled()
   })
 
   test('loads without throwing when the client cannot log', async () => {
