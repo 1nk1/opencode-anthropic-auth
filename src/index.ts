@@ -1,6 +1,7 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange } from './auth.ts'
-import { CLIENT_ID, TOKEN_URL } from './constants.ts'
+import { resolveClaudeCodeVersion } from './config.ts'
+import { CLAUDE_CODE_VERSION, CLIENT_ID, TOKEN_URL } from './constants.ts'
 import {
   createStrippedStream,
   isInsecure,
@@ -10,7 +11,40 @@ import {
   setOAuthHeaders,
 } from './transform.ts'
 
+/**
+ * Report a bad version override to the server log.
+ *
+ * Best-effort: a misconfigured override degrades to the bundled version, so a
+ * logging failure must not take the plugin down with it.
+ */
+async function logInvalidVersionOverride(
+  client: unknown,
+  message: string,
+): Promise<void> {
+  try {
+    // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose app.log
+    await (client as any)?.app?.log({
+      body: {
+        service: 'anthropic-auth',
+        level: 'error',
+        message,
+      },
+    })
+  } catch {
+    /* Logging is best-effort; the fallback version still applies. */
+  }
+}
+
 export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
+  // Resolved once per plugin instance so every request reports the same
+  // version in both the user-agent and the billing header.
+  const resolution = resolveClaudeCodeVersion()
+  if (resolution.type === 'invalid') {
+    await logInvalidVersionOverride(client, resolution.error)
+  }
+  const claudeCodeVersion =
+    resolution.type === 'success' ? resolution.version : CLAUDE_CODE_VERSION
+
   return {
     auth: {
       provider: 'anthropic',
@@ -141,11 +175,11 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
 
               const requestHeaders = mergeHeaders(input, init)
               // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
-              setOAuthHeaders(requestHeaders, auth.access!)
+              setOAuthHeaders(requestHeaders, auth.access!, claudeCodeVersion)
 
               let body = init?.body
               if (body && typeof body === 'string') {
-                body = rewriteRequestBody(body)
+                body = rewriteRequestBody(body, claudeCodeVersion)
               }
 
               const rewritten = rewriteUrl(input)
