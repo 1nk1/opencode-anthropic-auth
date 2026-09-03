@@ -24,6 +24,7 @@
     "check": "bun turbo check:all",
     "test": "bun test",
     "types": "tsc",
+    "check:package": "bun run build && bun scripts/check-package.ts",
     "format": "biome check --write --unsafe",
     "format:check": "biome format .",
     "lint": "biome lint --error-on-warnings .",

@@ -1,6 +1,7 @@
 import { type Credential, Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange, refreshToken } from './auth.ts'
-import { REQUIRED_BETAS } from './constants.ts'
+import { resolveClaudeCodeVersion } from './config.ts'
+import { CLAUDE_CODE_VERSION, REQUIRED_BETAS } from './constants.ts'
 import {
   createStrippedStream,
   isInsecure,
@@ -74,6 +75,14 @@ export default Plugin.define({
   id: PLUGIN_ID,
   setup: async (ctx) => {
     warnIfInsecureUnsupported()
+    const versionResolution = resolveClaudeCodeVersion()
+    if (versionResolution.type === 'invalid') {
+      console.error(`[ex-machina.anthropic-auth] ${versionResolution.error}`)
+    }
+    const claudeCodeVersion =
+      versionResolution.type === 'success'
+        ? versionResolution.version
+        : CLAUDE_CODE_VERSION
 
     // Retain successful refreshes for this plugin generation so a host call
     // holding the rotated token cannot submit it again before persistence.
@@ -151,10 +160,12 @@ export default Plugin.define({
       const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
       const bodyText = hasBody ? await request.clone().text() : undefined
       const rewrittenBody =
-        bodyText !== undefined ? rewriteRequestBody(bodyText) : undefined
+        bodyText !== undefined
+          ? rewriteRequestBody(bodyText, claudeCodeVersion)
+          : undefined
 
       const headers = mergeHeaders(request)
-      setOAuthHeaders(headers, credential.access)
+      setOAuthHeaders(headers, credential.access, claudeCodeVersion)
       if (rewrittenBody !== undefined) headers.delete('content-length')
 
       const { input: rewrittenInput } = rewriteUrl(request.url)

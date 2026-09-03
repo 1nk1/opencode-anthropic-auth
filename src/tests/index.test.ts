@@ -1,4 +1,5 @@
 import { describe, expect, mock, spyOn, test } from 'bun:test'
+import { CLAUDE_CODE_VERSION } from '../constants'
 import plugin from '../index'
 
 /**
@@ -436,6 +437,76 @@ describe('session http.request hook', () => {
     expect(parsedBody.system[1].text).toBe(
       "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
     )
+  })
+
+  test('uses one configured Claude Code version for headers and billing', async () => {
+    const originalVersion = process.env.CLAUDE_CODE_VERSION
+    process.env.CLAUDE_CODE_VERSION = '2.9.99'
+
+    try {
+      const { ctx, sessionHooks } = anthropicOAuthContext()
+      await plugin.setup(ctx as any)
+      process.env.CLAUDE_CODE_VERSION = '3.0.0'
+
+      const event: any = {
+        model: { providerID: 'anthropic', modelID: 'claude-3' },
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: JSON.stringify({
+            messages: [{ role: 'user', content: 'hello world test message' }],
+          }),
+        }),
+      }
+      await sessionHooks.get('http.request')!(event)
+
+      expect(event.request.headers.get('user-agent')).toBe(
+        'claude-cli/2.9.99 (external, cli)',
+      )
+      const parsedBody = JSON.parse(await event.request.text())
+      expect(parsedBody.system[0].text).toContain('cc_version=2.9.99.')
+    } finally {
+      if (originalVersion === undefined) {
+        delete process.env.CLAUDE_CODE_VERSION
+      } else {
+        process.env.CLAUDE_CODE_VERSION = originalVersion
+      }
+    }
+  })
+
+  test('logs and ignores a malformed Claude Code version', async () => {
+    const originalVersion = process.env.CLAUDE_CODE_VERSION
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {})
+    process.env.CLAUDE_CODE_VERSION = 'latest'
+
+    try {
+      const { ctx, sessionHooks } = anthropicOAuthContext()
+      await plugin.setup(ctx as any)
+
+      expect(consoleError).toHaveBeenCalledTimes(1)
+      expect(String(consoleError.mock.calls[0]?.[0])).toContain(
+        'CLAUDE_CODE_VERSION',
+      )
+
+      const event: any = {
+        model: { providerID: 'anthropic', modelID: 'claude-3' },
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: '{}',
+        }),
+      }
+      await sessionHooks.get('http.request')!(event)
+
+      expect(event.request.headers.get('user-agent')).toBe(
+        `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+      )
+    } finally {
+      consoleError.mockRestore()
+      if (originalVersion === undefined) {
+        delete process.env.CLAUDE_CODE_VERSION
+      } else {
+        process.env.CLAUDE_CODE_VERSION = originalVersion
+      }
+    }
   })
 
   test('preserves GET requests without a body', async () => {
