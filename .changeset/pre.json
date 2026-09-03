@@ -6,6 +6,7 @@
   },
   "changesets": [
     "calm-streams-flow",
+    "olive-moons-repeat",
     "port-opencode-v2-plugin-api",
     "quiet-moons-repeat"
   ]
