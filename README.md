@@ -15,6 +15,9 @@
 
 An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
 
+> [!NOTE]
+> This repository uses [Agent Facets](https://agentfacets.io) to manage agent capabilities. See the [quickstart](https://docs.agentfacets.io/quickstart) to install the CLI and get started.
+
 ## Version support
 
 | OpenCode version | Plugin release | Support branch | npm dist-tag | Configuration key |
