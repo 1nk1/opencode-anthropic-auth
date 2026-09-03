@@ -15,13 +15,39 @@ export const ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR =
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/
 
 /**
+ * Is `candidate` an older Claude Code release than `baseline`?
+ *
+ * Both arguments must already match `VERSION_PATTERN`. Components are compared
+ * numerically rather than lexically — `2.1.99` sorts after `2.1.258` as a
+ * string but is the older release — and as `BigInt`, so an unbounded component
+ * cannot silently lose precision the way `Number` would.
+ */
+function isOlderVersion(candidate: string, baseline: string): boolean {
+  // The `0n` defaults are unreachable — `VERSION_PATTERN` guarantees exactly
+  // three components — but they keep the destructuring free of assertions.
+  const [major = 0n, minor = 0n, patch = 0n] = candidate
+    .split('.')
+    .map((part) => BigInt(part))
+  const [baseMajor = 0n, baseMinor = 0n, basePatch = 0n] = baseline
+    .split('.')
+    .map((part) => BigInt(part))
+
+  if (major !== baseMajor) return major < baseMajor
+  if (minor !== baseMinor) return minor < baseMinor
+  return patch < basePatch
+}
+
+/**
  * Outcome of reading the version override.
  *
  * The invalid arm carries no version: a malformed override must never reach
- * the request path, so callers cannot accidentally report one.
+ * the request path, so callers cannot accidentally report one. The outdated
+ * arm does carry one — an explicit older version is still honoured — but pairs
+ * it with the warning explaining why reporting it is risky.
  */
 export type ClaudeCodeVersionResolution =
   | { type: 'success'; version: string }
+  | { type: 'outdated'; version: string; warning: string }
   | { type: 'invalid'; error: string }
 
 /**
@@ -29,7 +55,10 @@ export type ClaudeCodeVersionResolution =
  *
  * Returns the bundled version when the override is unset. A set override is
  * trimmed and must look like a Claude Code release; anything else resolves to
- * `invalid` with a message describing how to correct it. Never throws.
+ * `invalid` with a message describing how to correct it. An override older
+ * than the bundled version resolves to `outdated`: it is still reported, since
+ * it was set deliberately, but it can lock the user out of newer models.
+ * Never throws.
  */
 export function resolveClaudeCodeVersion(
   raw: string | undefined = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR],
@@ -47,6 +76,19 @@ export function resolveClaudeCodeVersion(
         `Claude Code version. Expected major.minor.patch (e.g. ${CLAUDE_CODE_VERSION}). ` +
         `Reporting the bundled version ${CLAUDE_CODE_VERSION} instead — correct or unset ` +
         `${ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR} and restart OpenCode to use the override.`,
+    }
+  }
+
+  if (isOlderVersion(trimmed, CLAUDE_CODE_VERSION)) {
+    return {
+      type: 'outdated',
+      version: trimmed,
+      warning:
+        `${ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR} is set to ${JSON.stringify(trimmed)}, which is older ` +
+        `than the bundled Claude Code version ${CLAUDE_CODE_VERSION}. Anthropic gates model access on ` +
+        `the reported version, so reporting an older one can make newer models reject the request. ` +
+        `Set ${ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR} to ${CLAUDE_CODE_VERSION} or newer — or unset it ` +
+        `to use the bundled version — and restart OpenCode.`,
     }
   }
 

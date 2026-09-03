@@ -12,13 +12,15 @@ import {
 } from './transform.ts'
 
 /**
- * Report a bad version override to the server log.
+ * Report a problem with the version override to the server log.
  *
- * Best-effort: a misconfigured override degrades to the bundled version, so a
- * logging failure must not take the plugin down with it.
+ * Best-effort: a misconfigured override either degrades to the bundled version
+ * or is honoured as set, so a logging failure must not take the plugin down
+ * with it.
  */
-async function logInvalidVersionOverride(
+async function logVersionOverrideIssue(
   client: unknown,
+  level: 'warn' | 'error',
   message: string,
 ): Promise<void> {
   try {
@@ -26,12 +28,12 @@ async function logInvalidVersionOverride(
     await (client as any)?.app?.log({
       body: {
         service: 'anthropic-auth',
-        level: 'error',
+        level,
         message,
       },
     })
   } catch {
-    /* Logging is best-effort; the fallback version still applies. */
+    /* Logging is best-effort; the resolved version still applies. */
   }
 }
 
@@ -40,10 +42,14 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
   // version in both the user-agent and the billing header.
   const resolution = resolveClaudeCodeVersion()
   if (resolution.type === 'invalid') {
-    await logInvalidVersionOverride(client, resolution.error)
+    await logVersionOverrideIssue(client, 'error', resolution.error)
+  } else if (resolution.type === 'outdated') {
+    await logVersionOverrideIssue(client, 'warn', resolution.warning)
   }
+  // Only a malformed override lacks a usable version; an outdated one was set
+  // deliberately, so it is reported as configured.
   const claudeCodeVersion =
-    resolution.type === 'success' ? resolution.version : CLAUDE_CODE_VERSION
+    resolution.type === 'invalid' ? CLAUDE_CODE_VERSION : resolution.version
 
   return {
     auth: {
