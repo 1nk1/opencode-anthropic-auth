@@ -39,9 +39,6 @@ actually exists — `npm view @ex-machina/opencode-anthropic-auth dist-tags` sho
 
 Pin the exact version rather than tracking `@next`, which moves on every prerelease publish.
 
-Nothing is published to `next` yet — the first prerelease waits on the v2 port — so there is
-no version to substitute until then.
-
 ## Releasing v1 from `main`
 
 Unchanged from before the v2 train existed:
@@ -153,7 +150,7 @@ Always run the full check suite locally on the merged tree before opening the sy
 
 ```bash
 bun install --frozen-lockfile
-bun run types && bun run build && bun test && bun run format:check && bun run lint
+bun run types && bun run build && bun test && bun run check:package && bun run format:check && bun run lint
 ```
 
 ### Worked examples

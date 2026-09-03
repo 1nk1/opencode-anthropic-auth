@@ -918,6 +918,23 @@ describe('reported Claude Code version', () => {
     // cc_version is `<version>.<3-char suffix>`, so match the version segment.
     expect(billingHeader).toContain(`cc_version=${CLAUDE_CODE_VERSION}.`)
   })
+
+  test('user-agent and billing header both report an explicit version', () => {
+    const version = '2.9.99'
+    const headers = new Headers()
+    setOAuthHeaders(headers, 'token', version)
+
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'hello world test message' }],
+    })
+    const billingHeader = JSON.parse(rewriteRequestBody(body, version))
+      .system[0].text
+
+    expect(headers.get('user-agent')).toBe(
+      `claude-cli/${version} (external, cli)`,
+    )
+    expect(billingHeader).toContain(`cc_version=${version}.`)
+  })
 })
 
 // ---------------------------------------------------------------------------

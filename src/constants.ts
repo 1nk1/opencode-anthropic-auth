@@ -45,7 +45,11 @@ export const CCH_POSITIONS = [4, 7, 20]
 export const CLAUDE_CODE_VERSION = '2.1.258'
 export const CLAUDE_CODE_ENTRYPOINT = 'sdk-cli'
 
-export const USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`
+export function formatUserAgent(version: string): string {
+  return `claude-cli/${version} (external, cli)`
+}
+
+export const USER_AGENT = formatUserAgent(CLAUDE_CODE_VERSION)
 
 /**
  * Anchors that identify paragraphs to remove from the system prompt.

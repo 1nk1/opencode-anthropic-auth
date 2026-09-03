@@ -2,12 +2,13 @@ import { buildBillingHeaderValue } from './cch.ts'
 import {
   CLAUDE_CODE_ENTRYPOINT,
   CLAUDE_CODE_IDENTITY,
+  CLAUDE_CODE_VERSION,
+  formatUserAgent,
   OPENCODE_IDENTITY_PREFIX,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
   TEXT_REPLACEMENTS,
   TOOL_PREFIX,
-  USER_AGENT,
 } from './constants.ts'
 
 // Bound an incomplete SSE line so malformed streams cannot grow memory forever.
@@ -325,10 +326,11 @@ export function mergeBetaHeaders(headers: Headers): string {
 export function setOAuthHeaders(
   headers: Headers,
   accessToken: string,
+  version: string = CLAUDE_CODE_VERSION,
 ): Headers {
   headers.set('authorization', `Bearer ${accessToken}`)
   headers.set('anthropic-beta', mergeBetaHeaders(headers))
-  headers.set('user-agent', USER_AGENT)
+  headers.set('user-agent', formatUserAgent(version))
   headers.delete('x-api-key')
   return headers
 }
@@ -569,7 +571,10 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
 /**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
-export function rewriteRequestBody(body: string): string {
+export function rewriteRequestBody(
+  body: string,
+  version: string = CLAUDE_CODE_VERSION,
+): string {
   try {
     const parsed = JSON.parse(body)
     const billingHeader =
@@ -579,7 +584,7 @@ export function rewriteRequestBody(body: string): string {
       )
         ? buildBillingHeaderValue(
             parsed.messages,
-            undefined,
+            version,
             CLAUDE_CODE_ENTRYPOINT,
           )
         : null
