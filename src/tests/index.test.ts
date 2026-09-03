@@ -1,6 +1,16 @@
 import { describe, expect, mock, spyOn, test } from 'bun:test'
+import { ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR } from '../config'
 import { CLAUDE_CODE_VERSION } from '../constants'
 import plugin from '../index'
+
+/** Restore the version override captured before a test mutated it. */
+function restoreVersionOverride(original: string | undefined) {
+  if (original === undefined) {
+    delete process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
+  } else {
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = original
+  }
+}
 
 /**
  * Minimal mock of the OpenCode v2 promise plugin `Context`, covering only
@@ -440,13 +450,13 @@ describe('session http.request hook', () => {
   })
 
   test('uses one configured Claude Code version for headers and billing', async () => {
-    const originalVersion = process.env.CLAUDE_CODE_VERSION
-    process.env.CLAUDE_CODE_VERSION = '2.9.99'
+    const originalVersion = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '2.9.99'
 
     try {
       const { ctx, sessionHooks } = anthropicOAuthContext()
       await plugin.setup(ctx as any)
-      process.env.CLAUDE_CODE_VERSION = '3.0.0'
+      process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '3.0.0'
 
       const event: any = {
         model: { providerID: 'anthropic', modelID: 'claude-3' },
@@ -465,18 +475,14 @@ describe('session http.request hook', () => {
       const parsedBody = JSON.parse(await event.request.text())
       expect(parsedBody.system[0].text).toContain('cc_version=2.9.99.')
     } finally {
-      if (originalVersion === undefined) {
-        delete process.env.CLAUDE_CODE_VERSION
-      } else {
-        process.env.CLAUDE_CODE_VERSION = originalVersion
-      }
+      restoreVersionOverride(originalVersion)
     }
   })
 
   test('logs and ignores a malformed Claude Code version', async () => {
-    const originalVersion = process.env.CLAUDE_CODE_VERSION
+    const originalVersion = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
     const consoleError = spyOn(console, 'error').mockImplementation(() => {})
-    process.env.CLAUDE_CODE_VERSION = 'latest'
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = 'latest'
 
     try {
       const { ctx, sessionHooks } = anthropicOAuthContext()
@@ -484,7 +490,7 @@ describe('session http.request hook', () => {
 
       expect(consoleError).toHaveBeenCalledTimes(1)
       expect(String(consoleError.mock.calls[0]?.[0])).toContain(
-        'CLAUDE_CODE_VERSION',
+        ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR,
       )
 
       const event: any = {
@@ -501,11 +507,59 @@ describe('session http.request hook', () => {
       )
     } finally {
       consoleError.mockRestore()
-      if (originalVersion === undefined) {
-        delete process.env.CLAUDE_CODE_VERSION
-      } else {
-        process.env.CLAUDE_CODE_VERSION = originalVersion
+      restoreVersionOverride(originalVersion)
+    }
+  })
+
+  test('warns about an outdated version override but still reports it', async () => {
+    const originalVersion = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
+    const consoleWarn = spyOn(console, 'warn').mockImplementation(() => {})
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '2.1.99'
+
+    try {
+      const { ctx, sessionHooks } = anthropicOAuthContext()
+      await plugin.setup(ctx as any)
+
+      expect(consoleWarn).toHaveBeenCalledTimes(1)
+      expect(String(consoleWarn.mock.calls[0]?.[0])).toContain(
+        ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR,
+      )
+
+      const event: any = {
+        model: { providerID: 'anthropic', modelID: 'claude-3' },
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: '{}',
+        }),
       }
+      await sessionHooks.get('http.request')!(event)
+
+      // An outdated override was set deliberately, so it is still reported.
+      expect(event.request.headers.get('user-agent')).toBe(
+        'claude-cli/2.1.99 (external, cli)',
+      )
+    } finally {
+      consoleWarn.mockRestore()
+      restoreVersionOverride(originalVersion)
+    }
+  })
+
+  test('stays silent for an override at or above the bundled version', async () => {
+    const originalVersion = process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR]
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {})
+    const consoleWarn = spyOn(console, 'warn').mockImplementation(() => {})
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = CLAUDE_CODE_VERSION
+
+    try {
+      const { ctx } = anthropicOAuthContext()
+      await plugin.setup(ctx as any)
+
+      expect(consoleError).not.toHaveBeenCalled()
+      expect(consoleWarn).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+      consoleWarn.mockRestore()
+      restoreVersionOverride(originalVersion)
     }
   })
 

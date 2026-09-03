@@ -322,6 +322,9 @@ export function mergeBetaHeaders(headers: Headers): string {
 /**
  * Set OAuth-required headers on the request: authorization, beta, user-agent.
  * Removes x-api-key since we're using OAuth.
+ *
+ * `version` must be the same value passed to rewriteRequestBody for the same
+ * request, otherwise the two reported versions disagree.
  */
 export function setOAuthHeaders(
   headers: Headers,
@@ -570,6 +573,9 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
 
 /**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
+ *
+ * `version` must be the same value passed to setOAuthHeaders for the same
+ * request, otherwise the two reported versions disagree.
  */
 export function rewriteRequestBody(
   body: string,

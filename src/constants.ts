@@ -45,6 +45,13 @@ export const CCH_POSITIONS = [4, 7, 20]
 export const CLAUDE_CODE_VERSION = '2.1.258'
 export const CLAUDE_CODE_ENTRYPOINT = 'sdk-cli'
 
+/**
+ * Build the `user-agent` value for a reported Claude Code version.
+ *
+ * Both places we report the version (this header and the billing header's
+ * `cc_version`) must agree, so callers pass the same resolved version to each
+ * rather than reading a second, independently-derived constant.
+ */
 export function formatUserAgent(version: string): string {
   return `claude-cli/${version} (external, cli)`
 }
