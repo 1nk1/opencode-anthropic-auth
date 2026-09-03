@@ -25,6 +25,48 @@
         }
       ]
     },
+    "main-to-v2-sync": {
+      "source": {
+        "kind": "local",
+        "path": "./facets/main-to-v2-sync"
+      },
+      "version": "0.1.0",
+      "integrity": "sha256:b3f5a84f6f87ebd5cc2ce1ca27e75474185c52ab9118708d44a2f257fdfd27dc",
+      "assets": [
+        {
+          "scope": "project",
+          "type": "skill",
+          "name": "sync-main-to-v2",
+          "materialization": {
+            "kind": "authored"
+          },
+          "files": [
+            {
+              "path": "skills/sync-main-to-v2/SKILL.md",
+              "integrity": "sha256:9db00fe94f1676d4469fe4feb743abe42aed182c7e80c3aaae7ef883455dd533"
+            },
+            {
+              "path": "skills/sync-main-to-v2/references/plan.md",
+              "integrity": "sha256:20851f9d663afede0c96b79bf4cde9c3637cc39aa90d9d469b123eeed99c2f27"
+            }
+          ]
+        },
+        {
+          "scope": "project",
+          "type": "command",
+          "name": "sync-main",
+          "materialization": {
+            "kind": "authored"
+          },
+          "files": [
+            {
+              "path": "commands/sync-main.md",
+              "integrity": "sha256:00ab09b188ede02d7ab497320746076cf5073bf09c0e1b0900e4dff92848988c"
+            }
+          ]
+        }
+      ]
+    },
     "viper-plans": {
       "source": {
         "kind": "registry",
