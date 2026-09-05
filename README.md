@@ -2,9 +2,9 @@
 
 Private OpenCode 2 plugin for using a Claude Pro/Max subscription through Anthropic OAuth.
 
-> **Compatibility:** OpenCode 2 beta only. Version `2.0.0-beta.8` remains built
+> **Compatibility:** OpenCode 2 beta only. Version `2.0.0-beta.9` remains built
 > against the exact `@opencode-ai/plugin@0.0.0-beta-18866` SDK pin and has also
-> passed isolated compatibility checks on `opencode2 v0.0.0-beta-19151`. Do not
+> passed isolated compatibility checks on `opencode2 v0.0.0-beta-19157`. Do not
 > install it in OpenCode V1.
 
 This package is private and hosted in GitHub Packages. It contains no API keys,
@@ -31,7 +31,7 @@ export GITHUB_PACKAGES_TOKEN='github-token-with-read-packages'
 ## Install in OpenCode 2
 
 ```sh
-opencode2 plugin add @1nk1/opencode-anthropic-auth@2.0.0-beta.8
+opencode2 plugin add @1nk1/opencode-anthropic-auth@2.0.0-beta.9
 opencode2 service restart
 opencode2 plugin list
 ```
@@ -46,7 +46,7 @@ Alternatively, add the pinned package to the V2 configuration:
 
 ```json
 {
-  "plugins": ["@1nk1/opencode-anthropic-auth@2.0.0-beta.8"]
+  "plugins": ["@1nk1/opencode-anthropic-auth@2.0.0-beta.9"]
 }
 ```
 

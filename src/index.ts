@@ -43,6 +43,10 @@ const AMBIGUOUS_CONNECTION = 'Ambiguous OAuth connection'
 // Share only active rotations; settled credentials remain location-local.
 const refreshInFlight = new Map<string, Promise<Credential.OAuth>>()
 const blockedRefreshTokens = new Map<string, number>()
+// Overflow identities intentionally never expire, rotate, or lose bits:
+// forgetting one could replay a refresh token whose prior outcome was
+// ambiguous. The fixed-size filter bounds memory and fails closed; its
+// false-positive probability therefore grows over the process lifetime.
 const blockedRefreshTokenFilter = new Uint8Array(BLOCKED_REFRESH_FILTER_BYTES)
 
 function refreshTokenKey(refreshToken: string): string | undefined {
@@ -188,8 +192,9 @@ type AliasLease = {
   readonly key: string
   readonly aliases: ToolNameAliasTable
   references: number
+  activeResponses: number
   active: boolean
-  readonly timer: ReturnType<typeof setTimeout>
+  timer: ReturnType<typeof setTimeout> | undefined
 }
 
 export default Plugin.define({
@@ -251,21 +256,51 @@ export default Plugin.define({
       )
     }
 
+    const clearAliasLeaseTimer = (lease: AliasLease): void => {
+      if (lease.timer === undefined) return
+      clearTimeout(lease.timer)
+      lease.timer = undefined
+    }
+
     const expireAliasLease = (lease: AliasLease): void => {
       if (!lease.active) return
       lease.active = false
       if (aliasesByBody.get(lease.key) === lease) {
         aliasesByBody.delete(lease.key)
       }
-      clearTimeout(lease.timer)
+      clearAliasLeaseTimer(lease)
       lease.aliases.dispose()
+    }
+
+    const scheduleAliasLeaseExpiry = (lease: AliasLease): void => {
+      if (!lease.active || lease.activeResponses > 0) return
+      clearAliasLeaseTimer(lease)
+      const timer = setTimeout(() => {
+        if (lease.timer !== timer) return
+        lease.timer = undefined
+        if (lease.activeResponses === 0) expireAliasLease(lease)
+      }, ALIAS_REQUEST_TTL_MS)
+      timer.unref?.()
+      lease.timer = timer
+    }
+
+    const beginAliasResponse = (lease: AliasLease): void => {
+      if (!lease.active) return
+      if (lease.references <= lease.activeResponses) lease.references += 1
+      lease.activeResponses += 1
+      clearAliasLeaseTimer(lease)
     }
 
     const releaseAliasLease = (request: Request, lease: AliasLease): void => {
       aliasesByRequest.delete(request)
       if (!lease.active) return
+      if (lease.activeResponses > 0) lease.activeResponses -= 1
       lease.references -= 1
-      if (lease.references <= 0) expireAliasLease(lease)
+      if (lease.references <= 0) {
+        expireAliasLease(lease)
+      } else {
+        scheduleAliasLeaseExpiry(lease)
+      }
     }
 
     const registerAliasLease = (
@@ -279,6 +314,7 @@ export default Plugin.define({
         aliases.dispose()
         existing.references += 1
         aliasesByRequest.set(request, existing)
+        scheduleAliasLeaseExpiry(existing)
         return
       }
       if (aliasesByBody.size >= MAX_ACTIVE_ALIAS_REQUESTS) {
@@ -286,28 +322,27 @@ export default Plugin.define({
         throw new Error('Too many active Anthropic tool-name alias mappings')
       }
 
-      let lease!: AliasLease
-      const timer = setTimeout(
-        () => expireAliasLease(lease),
-        ALIAS_REQUEST_TTL_MS,
-      )
-      timer.unref?.()
-      lease = {
+      const lease: AliasLease = {
         key,
         aliases,
         references: 1,
+        activeResponses: 0,
         active: true,
-        timer,
+        timer: undefined,
       }
       aliasesByBody.set(key, lease)
       aliasesByRequest.set(request, lease)
+      scheduleAliasLeaseExpiry(lease)
     }
 
     const resolveAliasLease = async (
       request: Request,
     ): Promise<AliasLease | undefined> => {
       const direct = aliasesByRequest.get(request)
-      if (direct?.active) return direct
+      if (direct?.active) {
+        beginAliasResponse(direct)
+        return direct
+      }
       if (direct) aliasesByRequest.delete(request)
       if (!request.body) return undefined
       if (request.bodyUsed || request.body.locked) return undefined
@@ -329,6 +364,7 @@ export default Plugin.define({
       )
       const lease = aliasesByBody.get(requestBodyKey(body))
       if (!lease?.active) return undefined
+      beginAliasResponse(lease)
       aliasesByRequest.set(request, lease)
       return lease
     }
@@ -575,13 +611,11 @@ export default Plugin.define({
       if (event.model.providerID !== INTEGRATION_ID) return
       if (!isTransformedOAuthRequest(event.request)) return
       if (!event.response.ok) {
-        let lease = aliasesByRequest.get(event.request)
-        if (!lease) {
-          try {
-            lease = await resolveAliasLease(event.request)
-          } catch {
-            // Error responses must remain passthrough even when cleanup lookup fails.
-          }
+        let lease: AliasLease | undefined
+        try {
+          lease = await resolveAliasLease(event.request)
+        } catch {
+          // Error responses must remain passthrough even when cleanup lookup fails.
         }
         if (lease) releaseAliasLease(event.request, lease)
         if (event.response.status === 429) {
@@ -593,7 +627,12 @@ export default Plugin.define({
         }
         return
       }
-      const lease = await resolveAliasLease(event.request)
+      let lease: AliasLease | undefined
+      try {
+        lease = await resolveAliasLease(event.request)
+      } catch {
+        // A successful response must survive a best-effort alias lookup failure.
+      }
       const aliases =
         lease?.aliases ?? new ToolNameAliasTable({ maxEntries: 0, maxBytes: 0 })
       const release = () => {
