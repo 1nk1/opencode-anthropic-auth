@@ -234,6 +234,7 @@ type AliasLease = {
   references: number
   activeResponses: number
   active: boolean
+  retired: boolean
   timer: ReturnType<typeof setTimeout> | undefined
 }
 
@@ -269,6 +270,7 @@ export default Plugin.define({
     const transformedRequests = new WeakSet<Request>()
     const ownershipKey = randomBytes(32)
     let reconstructedAliasLookups = 0
+    let setupActive = true
     const connectionByRequest = new WeakMap<Request, string>()
     const connectionByAuthorization = new Map<
       string,
@@ -340,7 +342,7 @@ export default Plugin.define({
     }
 
     const scheduleAliasLeaseExpiry = (lease: AliasLease): void => {
-      if (!lease.active || lease.activeResponses > 0) return
+      if (!lease.active || lease.retired || lease.activeResponses > 0) return
       clearAliasLeaseTimer(lease)
       const timer = setTimeout(() => {
         if (lease.timer !== timer) return
@@ -352,10 +354,24 @@ export default Plugin.define({
     }
 
     const beginAliasResponse = (lease: AliasLease): void => {
-      if (!lease.active) return
+      if (!lease.active || lease.retired) return
       if (lease.references <= lease.activeResponses) lease.references += 1
       lease.activeResponses += 1
       clearAliasLeaseTimer(lease)
+    }
+
+    const retireAliasLease = (lease: AliasLease): void => {
+      if (!lease.active || lease.retired) return
+      lease.retired = true
+      if (aliasesByFingerprint.get(lease.key) === lease) {
+        aliasesByFingerprint.delete(lease.key)
+      }
+      clearAliasLeaseTimer(lease)
+      if (lease.activeResponses === 0) {
+        expireAliasLease(lease)
+      } else {
+        lease.references = lease.activeResponses
+      }
     }
 
     const releaseAliasLease = (request: Request, lease: AliasLease): void => {
@@ -363,7 +379,10 @@ export default Plugin.define({
       if (!lease.active) return
       if (lease.activeResponses > 0) lease.activeResponses -= 1
       lease.references -= 1
-      if (lease.references <= 0) {
+      if (
+        lease.references <= 0 ||
+        (lease.retired && lease.activeResponses === 0)
+      ) {
         expireAliasLease(lease)
       } else {
         scheduleAliasLeaseExpiry(lease)
@@ -381,7 +400,7 @@ export default Plugin.define({
         throw new Error('Unable to track transformed Anthropic request')
       }
       const existing = aliasesByFingerprint.get(key)
-      if (existing?.active) {
+      if (existing?.active && !existing.retired) {
         aliases.dispose()
         existing.references += 1
         aliasesByRequest.set(request, existing)
@@ -399,6 +418,7 @@ export default Plugin.define({
         references: 1,
         activeResponses: 0,
         active: true,
+        retired: false,
         timer: undefined,
       }
       aliasesByFingerprint.set(key, lease)
@@ -410,7 +430,7 @@ export default Plugin.define({
       request: Request,
     ): Promise<AliasLease | undefined> => {
       const direct = aliasesByRequest.get(request)
-      if (direct?.active) {
+      if (direct?.active && !direct.retired) {
         beginAliasResponse(direct)
         return direct
       }
@@ -567,9 +587,10 @@ export default Plugin.define({
     })
 
     await ctx.session.hook('http.request', async (event) => {
+      if (!setupActive) return
       if (event.model.providerID !== INTEGRATION_ID) return
       const active = await resolveActiveOAuth(ctx)
-      if (!active) return
+      if (!setupActive || !active) return
       const { credential } = active
       const connectionDescription = describeConnection(active.connection)
 
@@ -622,6 +643,7 @@ export default Plugin.define({
             'Anthropic request body',
           )
         : undefined
+      if (!setupActive) return
       const aliases = new ToolNameAliasTable({
         maxEntries: MAX_REQUEST_ALIAS_ENTRIES,
         maxBytes: MAX_REQUEST_ALIAS_BYTES,
@@ -670,6 +692,7 @@ export default Plugin.define({
     })
 
     await ctx.session.hook('http.response', async (event) => {
+      if (!setupActive) return
       if (event.model.providerID !== INTEGRATION_ID) return
       if (!hasTransformedOAuthShape(event.request)) return
       const ownedDirectly = transformedRequests.has(event.request)
@@ -713,7 +736,8 @@ export default Plugin.define({
     })
 
     return () => {
-      for (const lease of aliasesByFingerprint.values()) expireAliasLease(lease)
+      setupActive = false
+      for (const lease of aliasesByFingerprint.values()) retireAliasLease(lease)
       aliasesByFingerprint.clear()
       for (const entry of connectionByAuthorization.values()) {
         clearTimeout(entry.timer)

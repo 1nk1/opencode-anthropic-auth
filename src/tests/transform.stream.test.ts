@@ -4,6 +4,7 @@ import {
   MAX_JSON_NUMBER_BYTES,
   MAX_JSON_OBJECT_KEYS,
   MAX_JSON_PENDING_BLOCK_BYTES,
+  MAX_JSON_RETAINED_KEY_BYTES,
   MAX_JSON_STRING_BYTES,
 } from '../json-response-stream'
 import {
@@ -1024,6 +1025,40 @@ describe('bounded structured JSON responses', () => {
     await expect(readText(jsonResponse(payload))).rejects.toThrow()
   })
 
+  test('does not include duplicate object-key content in parser errors', async () => {
+    const untrustedKey = `private-key-${'x'.repeat(1024)}`
+    const payload = `{${JSON.stringify(untrustedKey)}:1,${JSON.stringify(untrustedKey)}:2}`
+    let failure: unknown
+
+    try {
+      await readText(jsonResponse(payload))
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toBe(
+      'Malformed Anthropic response JSON: duplicate object key',
+    )
+    expect((failure as Error).message).not.toContain(untrustedKey)
+  })
+
+  test('does not include duplicate SSE object-key content in parser errors', async () => {
+    const untrustedKey = `private-sse-key-${'x'.repeat(1024)}`
+    const json = `{${JSON.stringify(untrustedKey)}:1,${JSON.stringify(untrustedKey)}:2}`
+    let failure: unknown
+
+    try {
+      await readText(createStrippedStream(sseResponse([`data: ${json}\n\n`])))
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toBe(
+      'Malformed Anthropic response JSON: duplicate object key',
+    )
+    expect((failure as Error).message).not.toContain(untrustedKey)
+  })
+
   test.each([
     ['root type', `{"type":"message","type":"message"}`],
     ['root content', `{"type":"message","content":[],"content":[]}`],
@@ -1249,6 +1284,29 @@ describe('bounded structured JSON responses', () => {
     await expect(
       readText(jsonResponse(JSON.stringify(value))),
     ).rejects.toThrow()
+  })
+
+  test('bounds aggregate object keys retained until an object closes', async () => {
+    const key = 'k'.repeat(1024 * 1024)
+    const count = Math.floor(MAX_JSON_RETAINED_KEY_BYTES / key.length) + 1
+    const payload = `{${Array.from(
+      { length: count },
+      (_, index) => `${JSON.stringify(`${index}${key}`)}:null`,
+    ).join(',')}}`
+
+    await expect(readText(jsonResponse(payload))).rejects.toThrow(
+      'Anthropic response JSON exceeds retained-key byte limit',
+    )
+  })
+
+  test('releases retained-key bytes when sibling objects close', async () => {
+    const key = 'k'.repeat(1024 * 1024)
+    const payload = `[${Array.from(
+      { length: 9 },
+      (_, index) => `{${JSON.stringify(`${index}${key}`)}:null}`,
+    ).join(',')}]`
+
+    expect(await readText(jsonResponse(payload))).toBe(payload)
   })
 
   test('rejects application/json with more than 100000 traversal nodes', async () => {

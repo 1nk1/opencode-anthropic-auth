@@ -473,7 +473,7 @@ function rewriteJsonStringTokens(
         }
         if (seenKeys.has(key)) {
           throw new Error(
-            `Malformed Anthropic response JSON: duplicate object key: ${key}`,
+            'Malformed Anthropic response JSON: duplicate object key',
           )
         }
         seenKeys.add(key)

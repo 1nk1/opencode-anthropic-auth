@@ -1890,6 +1890,67 @@ describe('session http.response hook', () => {
     ).toBe(alias)
   })
 
+  test('defers alias disposal until an active response stream finalizes after setup cleanup', async () => {
+    const { ctx, sessionHooks } = anthropicOAuthContext()
+    const cleanup = await plugin.setup(ctx as any)
+    const originalName = 'cleanup-active-stream-'.repeat(4)
+    const requestEvent: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: new Request('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: JSON.stringify({ tools: [{ name: originalName }] }),
+      }),
+    }
+    const requestHook = sessionHooks.get('http.request')!
+    const responseHook = sessionHooks.get('http.response')!
+    await requestHook(requestEvent)
+    const alias = JSON.parse(await requestEvent.request.clone().text()).tools[0]
+      .name
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const event: any = {
+      model: requestEvent.model,
+      request: requestEvent.request,
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          start(streamController) {
+            controller = streamController
+          },
+        }),
+        { headers: { 'content-type': 'application/json' } },
+      ),
+    }
+    await responseHook(event)
+    await cleanup?.()
+
+    controller.enqueue(
+      new TextEncoder().encode(
+        JSON.stringify({
+          type: 'message',
+          content: [{ type: 'tool_use', name: alias }],
+        }),
+      ),
+    )
+    controller.close()
+    expect(JSON.parse(await event.response.text()).content[0].name).toBe(
+      originalName,
+    )
+
+    const laterResponse = Response.json({
+      type: 'message',
+      content: [{ type: 'tool_use', name: alias }],
+    })
+    const laterEvent: any = {
+      model: requestEvent.model,
+      request: requestEvent.request,
+      response: laterResponse,
+    }
+    await responseHook(laterEvent)
+    expect(laterEvent.response).toBe(laterResponse)
+    expect(JSON.parse(await laterEvent.response.text()).content[0].name).toBe(
+      alias,
+    )
+  })
+
   test('isolates long aliases between reconstructed requests', async () => {
     const { ctx, sessionHooks } = createMockContext()
     ;(ctx.integration.connection.active as any).mockImplementation(

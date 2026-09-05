@@ -5,6 +5,7 @@ export const MAX_JSON_STRING_BYTES = 8 * 1024 * 1024
 export const MAX_JSON_NUMBER_BYTES = 128
 export const MAX_JSON_DEPTH = 256
 export const MAX_JSON_OBJECT_KEYS = 100_000
+export const MAX_JSON_RETAINED_KEY_BYTES = 8 * 1024 * 1024
 export const MAX_JSON_NODES = 100_000
 export const MAX_JSON_PENDING_BLOCK_BYTES = 8 * 1024 * 1024
 
@@ -32,6 +33,7 @@ type ObjectFrame = {
   seenContent: boolean
   seenContentBlock: boolean
   seenKeys: Set<string>
+  retainedKeyBytes: number
 }
 
 type ArrayFrame = {
@@ -214,6 +216,7 @@ function objectFrame(role: FrameRole): ObjectFrame {
     seenContent: false,
     seenContentBlock: false,
     seenKeys: new Set(),
+    retainedKeyBytes: 0,
   }
 }
 
@@ -239,6 +242,7 @@ export function createBoundedJsonToolNameStream(
   let pending: PendingToken | undefined
   let outputController: TransformStreamDefaultController<Uint8Array>
   let objectKeys = 0
+  let retainedKeyBytes = 0
   let nodes = 0
   let holdingOutput = false
   let heldLength = 0
@@ -477,9 +481,15 @@ export function createBoundedJsonToolNameStream(
       throw new Error('Anthropic response JSON exceeds object-key limit')
     }
     if (frame.seenKeys.has(key)) {
-      throw malformedJson(`duplicate object key: ${key}`)
+      throw malformedJson('duplicate object key')
+    }
+    const keyBytes = encoder.encode(key).byteLength
+    if (keyBytes > MAX_JSON_RETAINED_KEY_BYTES - retainedKeyBytes) {
+      throw new Error('Anthropic response JSON exceeds retained-key byte limit')
     }
     frame.seenKeys.add(key)
+    frame.retainedKeyBytes += keyBytes
+    retainedKeyBytes += keyBytes
     if (frame.role === 'root') {
       if (key === 'type') {
         if (frame.seenType) throw malformedJson('duplicate root type')
@@ -580,6 +590,11 @@ export function createBoundedJsonToolNameStream(
         : frame.state === 'value-or-end' || frame.state === 'comma-or-end'
     if (!canClose) throw malformedJson('incomplete container')
     stack.pop()
+    if (frame.mode === 'object') {
+      retainedKeyBytes -= frame.retainedKeyBytes
+      frame.retainedKeyBytes = 0
+      frame.seenKeys.clear()
+    }
     if (frame.mode === 'object' && frame.role === 'root') {
       resolveDeferredNames(frame)
     }
