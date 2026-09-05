@@ -13,6 +13,7 @@ import {
   TOOL_PREFIX,
 } from './constants.ts'
 import {
+  assertWellFormedUtf16,
   createBoundedJsonToolNameStream,
   MAX_JSON_NODES,
   MAX_JSON_OBJECT_KEYS,
@@ -40,24 +41,6 @@ type ToolNameAliasOptions = {
 
 function base64url(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('base64url')
-}
-
-function assertWellFormedUtf16(value: string): void {
-  for (let index = 0; index < value.length; index += 1) {
-    const unit = value.charCodeAt(index)
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      if (index + 1 >= value.length) {
-        throw new Error('Tool names must contain well-formed UTF-16')
-      }
-      const next = value.charCodeAt(index + 1)
-      if (next < 0xdc00 || next > 0xdfff) {
-        throw new Error('Tool names must contain well-formed UTF-16')
-      }
-      index += 1
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw new Error('Tool names must contain well-formed UTF-16')
-    }
-  }
 }
 
 /**

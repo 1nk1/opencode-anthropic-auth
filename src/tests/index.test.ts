@@ -1009,6 +1009,57 @@ describe('session http.request hook', () => {
     expect(await rewritten.text()).toBe('')
   })
 
+  test('routes non-transform requests through the configured custom endpoint', async () => {
+    const originalBaseUrl = process.env.ANTHROPIC_BASE_URL
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example/base'
+
+    try {
+      const { ctx, sessionHooks } = anthropicOAuthContext()
+      await plugin.setup(ctx as any)
+      const requestHook = sessionHooks.get('http.request')!
+
+      const getEvent: any = {
+        model: { providerID: 'anthropic', modelID: 'claude-3' },
+        request: new Request(
+          'https://api.anthropic.com/v1/models?source=opencode',
+        ),
+      }
+      await requestHook(getEvent)
+
+      expect(getEvent.request.url).toBe(
+        'https://proxy.example/v1/models?source=opencode',
+      )
+      expect(getEvent.request.method).toBe('GET')
+      expect(getEvent.request.headers.get('authorization')).toBe(
+        'Bearer my-access-token',
+      )
+
+      const body = '{"model":"claude-3"}'
+      const postEvent: any = {
+        model: getEvent.model,
+        request: new Request('https://api.anthropic.com/v1/models', {
+          method: 'POST',
+          headers: {
+            'content-length': String(body.length),
+            'content-type': 'application/json',
+          },
+          body,
+        }),
+      }
+      await requestHook(postEvent)
+
+      expect(postEvent.request.url).toBe('https://proxy.example/v1/models')
+      expect(postEvent.request.method).toBe('POST')
+      expect(postEvent.request.headers.get('content-length')).toBe(
+        String(body.length),
+      )
+      expect(await postEvent.request.text()).toBe(body)
+    } finally {
+      if (originalBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL
+      else process.env.ANTHROPIC_BASE_URL = originalBaseUrl
+    }
+  })
+
   test('preserves POST requests without a body', async () => {
     const { ctx, sessionHooks } = anthropicOAuthContext()
     await plugin.setup(ctx as any)
@@ -1309,6 +1360,237 @@ describe('session http.response hook', () => {
     )
   })
 
+  test('keeps one long alias alive across multiple concurrent reconstructed response streams', async () => {
+    const { ctx, sessionHooks } = anthropicOAuthContext()
+    await plugin.setup(ctx as any)
+    const originalName = 'parallel-reconstructed-'.repeat(4)
+    const model = { providerID: 'anthropic', modelID: 'claude-3' }
+    const requestEvent: any = {
+      model,
+      request: new Request('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: JSON.stringify({ tools: [{ name: originalName }] }),
+      }),
+    }
+    await sessionHooks.get('http.request')!(requestEvent)
+    const alias = JSON.parse(await requestEvent.request.clone().text()).tools[0]
+      .name
+    const encoder = new TextEncoder()
+    let firstController!: ReadableStreamDefaultController<Uint8Array>
+    let secondController!: ReadableStreamDefaultController<Uint8Array>
+    const responseBody = JSON.stringify({
+      type: 'message',
+      content: [{ type: 'tool_use', name: alias }],
+    })
+    const responseEvent = (
+      controllerReady: (
+        controller: ReadableStreamDefaultController<Uint8Array>,
+      ) => void,
+    ): any => ({
+      model,
+      request: new Request(requestEvent.request),
+      response: new Response(
+        new ReadableStream<Uint8Array>({ start: controllerReady }),
+        { headers: { 'content-type': 'application/json' } },
+      ),
+    })
+    const firstEvent = responseEvent((controller) => {
+      firstController = controller
+    })
+    const secondEvent = responseEvent((controller) => {
+      secondController = controller
+    })
+    const responseHook = sessionHooks.get('http.response')!
+    await responseHook(firstEvent)
+    await responseHook(secondEvent)
+
+    firstController.enqueue(encoder.encode(responseBody))
+    firstController.close()
+    expect(JSON.parse(await firstEvent.response.text()).content[0].name).toBe(
+      originalName,
+    )
+
+    secondController.enqueue(encoder.encode(responseBody))
+    secondController.close()
+    expect(JSON.parse(await secondEvent.response.text()).content[0].name).toBe(
+      originalName,
+    )
+  })
+
+  test('keeps reconstructed ownership atomic when a concurrent response finalizes synchronously', async () => {
+    const { ctx, sessionHooks } = anthropicOAuthContext()
+    await plugin.setup(ctx as any)
+    const originalName = 'synchronous-passthrough-'.repeat(4)
+    const model = { providerID: 'anthropic', modelID: 'claude-3' }
+    const requestEvent: any = {
+      model,
+      request: new Request('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: JSON.stringify({ tools: [{ name: originalName }] }),
+      }),
+    }
+    await sessionHooks.get('http.request')!(requestEvent)
+    const alias = JSON.parse(await requestEvent.request.clone().text()).tools[0]
+      .name
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const passthroughEvent: any = {
+      model,
+      request: new Request(requestEvent.request),
+      response: new Response('unchanged', {
+        headers: { 'content-type': 'text/plain' },
+      }),
+    }
+    const transformedEvent: any = {
+      model,
+      request: new Request(requestEvent.request),
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          start(streamController) {
+            controller = streamController
+          },
+        }),
+        { headers: { 'content-type': 'application/json' } },
+      ),
+    }
+    const responseHook = sessionHooks.get('http.response')!
+    await Promise.all([
+      responseHook(passthroughEvent),
+      responseHook(transformedEvent),
+    ])
+    expect(await passthroughEvent.response.text()).toBe('unchanged')
+
+    controller.enqueue(
+      new TextEncoder().encode(
+        JSON.stringify({
+          type: 'message',
+          content: [{ type: 'tool_use', name: alias }],
+        }),
+      ),
+    )
+    controller.close()
+    expect(
+      JSON.parse(await transformedEvent.response.text()).content[0].name,
+    ).toBe(originalName)
+  })
+
+  test('keeps aliases active past the request TTL while a response stream owns them', async () => {
+    const scheduled: Array<{ handler: () => void; delay: number }> = []
+    const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => void,
+      delay: number,
+    ) => {
+      scheduled.push({ handler, delay })
+      return { unref() {} }
+    }) as unknown as typeof setTimeout)
+
+    try {
+      const { ctx, sessionHooks } = anthropicOAuthContext()
+      const cleanup = await plugin.setup(ctx as any)
+      const originalName = 'long-running-stream-'.repeat(4)
+      const requestEvent: any = {
+        model: { providerID: 'anthropic', modelID: 'claude-3' },
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: JSON.stringify({ tools: [{ name: originalName }] }),
+        }),
+      }
+      await sessionHooks.get('http.request')!(requestEvent)
+      const alias = JSON.parse(await requestEvent.request.clone().text())
+        .tools[0].name
+      let controller!: ReadableStreamDefaultController<Uint8Array>
+      const event: any = {
+        model: requestEvent.model,
+        request: requestEvent.request,
+        response: new Response(
+          new ReadableStream<Uint8Array>({
+            start(streamController) {
+              controller = streamController
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+      }
+      await sessionHooks.get('http.response')!(event)
+
+      for (const entry of scheduled.filter(
+        ({ delay }) => delay === 5 * 60_000,
+      )) {
+        entry.handler()
+      }
+      controller.enqueue(
+        new TextEncoder().encode(
+          `data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"${alias}"}}\n\n`,
+        ),
+      )
+      controller.close()
+
+      expect(await event.response.text()).toContain(`"name":"${originalName}"`)
+      await cleanup?.()
+    } finally {
+      setTimeoutSpy.mockRestore()
+    }
+  })
+
+  test('extends an idle alias lease when an identical request reuses it', async () => {
+    const scheduled: Array<{ handler: () => void; delay: number }> = []
+    const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => void,
+      delay: number,
+    ) => {
+      scheduled.push({ handler, delay })
+      return { unref() {} }
+    }) as unknown as typeof setTimeout)
+
+    try {
+      const { ctx, sessionHooks } = anthropicOAuthContext()
+      const cleanup = await plugin.setup(ctx as any)
+      const originalName = 'reused-request-'.repeat(5)
+      const body = JSON.stringify({ tools: [{ name: originalName }] })
+      const model = { providerID: 'anthropic', modelID: 'claude-3' }
+      const requestHook = sessionHooks.get('http.request')!
+      const firstEvent: any = {
+        model,
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body,
+        }),
+      }
+      await requestHook(firstEvent)
+      const firstExpiry = scheduled.find(
+        ({ delay }) => delay === 5 * 60_000,
+      )?.handler
+      expect(firstExpiry).toBeFunction()
+
+      const secondEvent: any = {
+        model,
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body,
+        }),
+      }
+      await requestHook(secondEvent)
+      const alias = JSON.parse(await secondEvent.request.clone().text())
+        .tools[0].name
+      firstExpiry?.()
+
+      const responseEvent: any = {
+        model,
+        request: secondEvent.request,
+        response: Response.json({
+          type: 'message',
+          content: [{ type: 'tool_use', name: alias }],
+        }),
+      }
+      await sessionHooks.get('http.response')!(responseEvent)
+      expect(
+        JSON.parse(await responseEvent.response.text()).content[0].name,
+      ).toBe(originalName)
+      await cleanup?.()
+    } finally {
+      setTimeoutSpy.mockRestore()
+    }
+  })
+
   test('fails closed when a reconstructed transformed request body was consumed', async () => {
     const { ctx, sessionHooks } = createMockContext()
     ;(ctx.integration.connection.active as any).mockImplementation(
@@ -1354,6 +1636,113 @@ describe('session http.response hook', () => {
     expect(
       JSON.parse(await responseEvent.response.text()).content[0].name,
     ).toBe(alias)
+  })
+
+  test('delivers a successful response when reconstructed alias lookup exceeds the request bound', async () => {
+    const { ctx, sessionHooks } = anthropicOAuthContext()
+    await plugin.setup(ctx as any)
+    const originalName = 'bounded-lookup-'.repeat(8)
+    const requestEvent: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: new Request('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        body: JSON.stringify({ tools: [{ name: originalName }] }),
+      }),
+    }
+    await sessionHooks.get('http.request')!(requestEvent)
+    const alias = JSON.parse(await requestEvent.request.clone().text()).tools[0]
+      .name
+    const reconstructed = new Request(requestEvent.request)
+    reconstructed.headers.set('content-length', String(10 * 1024 * 1024 + 1))
+    const responseBody = JSON.stringify({
+      type: 'message',
+      content: [{ type: 'tool_use', name: alias }],
+    })
+    const event: any = {
+      model: requestEvent.model,
+      request: reconstructed,
+      response: new Response(responseBody, {
+        status: 200,
+        statusText: 'OK',
+        headers: {
+          'content-type': 'application/json',
+          'x-request-id': 'req_fixture_lookup',
+        },
+      }),
+    }
+
+    await expect(
+      sessionHooks.get('http.response')!(event),
+    ).resolves.toBeUndefined()
+    expect(event.response.status).toBe(200)
+    expect(event.response.statusText).toBe('OK')
+    expect(event.response.headers.get('x-request-id')).toBe(
+      'req_fixture_lookup',
+    )
+    expect(await event.response.text()).toBe(responseBody)
+  })
+
+  test('reclaims an unresolved alias lease after its idle TTL', async () => {
+    const scheduled: Array<{ handler: () => void; delay: number }> = []
+    const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      handler: () => void,
+      delay: number,
+    ) => {
+      scheduled.push({ handler, delay })
+      return { unref() {} }
+    }) as unknown as typeof setTimeout)
+
+    try {
+      const { ctx, sessionHooks } = anthropicOAuthContext()
+      const cleanup = await plugin.setup(ctx as any)
+      const originalName = 'unresolved-lease-'.repeat(5)
+      const requestEvent: any = {
+        model: { providerID: 'anthropic', modelID: 'claude-3' },
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: JSON.stringify({ tools: [{ name: originalName }] }),
+        }),
+      }
+      await sessionHooks.get('http.request')!(requestEvent)
+      const expiry = scheduled.find(
+        ({ delay }) => delay === 5 * 60_000,
+      )?.handler
+      expect(expiry).toBeFunction()
+      const alias = JSON.parse(await requestEvent.request.clone().text())
+        .tools[0].name
+      const reconstructed = new Request(requestEvent.request)
+      reconstructed.headers.set('content-length', String(10 * 1024 * 1024 + 1))
+      const responseHook = sessionHooks.get('http.response')!
+      const unresolvedEvent: any = {
+        model: requestEvent.model,
+        request: reconstructed,
+        response: Response.json({
+          type: 'message',
+          content: [{ type: 'tool_use', name: alias }],
+        }),
+      }
+      await responseHook(unresolvedEvent)
+      expect(
+        JSON.parse(await unresolvedEvent.response.text()).content[0].name,
+      ).toBe(alias)
+
+      expiry?.()
+      const afterExpiry: any = {
+        model: requestEvent.model,
+        request: requestEvent.request,
+        response: Response.json({
+          type: 'message',
+          content: [{ type: 'tool_use', name: alias }],
+        }),
+      }
+      await responseHook(afterExpiry)
+      expect(
+        JSON.parse(await afterExpiry.response.text()).content[0].name,
+      ).toBe(alias)
+      await cleanup?.()
+    } finally {
+      setTimeoutSpy.mockRestore()
+    }
   })
 
   test('releases a long alias when a transformed response body is locked', async () => {
@@ -1582,6 +1971,55 @@ describe('session http.response hook', () => {
 
     const decoded = JSON.parse(await responseEvent.response.text())
     expect(decoded.content[0].name).toBe(originalName)
+  })
+
+  test('decodes and releases aliases when the request explicitly uses beta=false', async () => {
+    const { ctx, sessionHooks } = anthropicOAuthContext()
+    await plugin.setup(ctx as any)
+
+    const originalName = 'beta-false-'.repeat(8)
+    const requestEvent: any = {
+      model: { providerID: 'anthropic', modelID: 'claude-3' },
+      request: new Request('https://api.anthropic.com/v1/messages?beta=false', {
+        method: 'POST',
+        body: JSON.stringify({ tools: [{ name: originalName }] }),
+      }),
+    }
+    const requestHook = sessionHooks.get('http.request')!
+    const responseHook = sessionHooks.get('http.response')!
+    await requestHook(requestEvent)
+    expect(new URL(requestEvent.request.url).searchParams.get('beta')).toBe(
+      'false',
+    )
+    const alias = JSON.parse(await requestEvent.request.clone().text()).tools[0]
+      .name
+    expect(alias).toMatch(/^mcp_H[A-Za-z0-9_-]+$/)
+
+    const firstEvent: any = {
+      model: requestEvent.model,
+      request: requestEvent.request,
+      response: Response.json({
+        type: 'message',
+        content: [{ type: 'tool_use', name: alias }],
+      }),
+    }
+    await responseHook(firstEvent)
+    expect(JSON.parse(await firstEvent.response.text()).content[0].name).toBe(
+      originalName,
+    )
+
+    const laterEvent: any = {
+      model: requestEvent.model,
+      request: requestEvent.request,
+      response: Response.json({
+        type: 'message',
+        content: [{ type: 'tool_use', name: alias }],
+      }),
+    }
+    await responseHook(laterEvent)
+    expect(JSON.parse(await laterEvent.response.text()).content[0].name).toBe(
+      alias,
+    )
   })
 
   test('releases a long alias after a reconstructed response is fully consumed', async () => {

@@ -140,7 +140,7 @@ function malformedJson(detail?: string): Error {
   )
 }
 
-function assertWellFormedUtf16(value: string): void {
+export function assertWellFormedUtf16(value: string): void {
   for (let index = 0; index < value.length; index += 1) {
     const unit = value.charCodeAt(index)
     if (unit >= 0xd800 && unit <= 0xdbff) {
