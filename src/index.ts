@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac, type Hmac, randomBytes } from 'node:crypto'
 import { type Credential, Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange, refreshToken } from './auth.ts'
 import { BodyLimitError, contentLength, readBoundedText } from './bounded.ts'
@@ -38,6 +38,8 @@ const MAX_REFRESH_CACHE_ENTRIES = 256
 const MAX_TRACKED_CONNECTIONS = 256
 const CONNECTION_TRACKING_TTL_MS = 5 * 60_000
 const MAX_ACTIVE_RESPONSE_TRANSFORMS = 256
+const MAX_RECONSTRUCTED_ALIAS_LOOKUPS = 32
+const MAX_TRACKED_REQUEST_URL_BYTES = 8 * 1024
 const UNKNOWN_CONNECTION = 'Unknown OAuth connection'
 const AMBIGUOUS_CONNECTION = 'Ambiguous OAuth connection'
 
@@ -170,7 +172,7 @@ async function resolveActiveOAuth(ctx: Plugin.Context): Promise<
   return undefined
 }
 
-function isTransformedOAuthRequest(request: Request): boolean {
+function hasTransformedOAuthShape(request: Request): boolean {
   const url = new URL(request.url)
   const betas = new Set(
     (request.headers.get('anthropic-beta') ?? '')
@@ -186,9 +188,32 @@ function isTransformedOAuthRequest(request: Request): boolean {
   )
 }
 
-function requestBodyKey(body: string): string {
-  const bytes = new TextEncoder().encode(body)
-  return `${bytes.byteLength}:${createHash('sha256').update(bytes).digest('base64url')}`
+const ownershipEncoder = new TextEncoder()
+
+function updateFramed(hmac: Hmac, bytes: Uint8Array): void {
+  const length = new Uint8Array(8)
+  new DataView(length.buffer).setBigUint64(0, BigInt(bytes.byteLength))
+  hmac.update(length)
+  hmac.update(bytes)
+}
+
+function requestLeaseKey(
+  ownershipKey: Uint8Array,
+  request: Request,
+  body: string,
+): string | undefined {
+  const authorizationKey = requestAuthorizationKey(request)
+  if (!authorizationKey) return undefined
+  const urlBytes = ownershipEncoder.encode(request.url)
+  if (urlBytes.byteLength > MAX_TRACKED_REQUEST_URL_BYTES) return undefined
+  const bodyBytes = ownershipEncoder.encode(body)
+  const hmac = createHmac('sha256', ownershipKey)
+  hmac.update('opencode-anthropic-auth/request-ownership/v1')
+  updateFramed(hmac, ownershipEncoder.encode(request.method))
+  updateFramed(hmac, urlBytes)
+  updateFramed(hmac, ownershipEncoder.encode(authorizationKey))
+  updateFramed(hmac, bodyBytes)
+  return `${bodyBytes.byteLength}:${hmac.digest('base64url')}`
 }
 
 function requestAuthorizationKey(request: Request): string | undefined {
@@ -240,7 +265,10 @@ export default Plugin.define({
         : versionResolution.version
 
     const aliasesByRequest = new WeakMap<Request, AliasLease>()
-    const aliasesByBody = new Map<string, AliasLease>()
+    const aliasesByFingerprint = new Map<string, AliasLease>()
+    const transformedRequests = new WeakSet<Request>()
+    const ownershipKey = randomBytes(32)
+    let reconstructedAliasLookups = 0
     const connectionByRequest = new WeakMap<Request, string>()
     const connectionByAuthorization = new Map<
       string,
@@ -304,8 +332,8 @@ export default Plugin.define({
     const expireAliasLease = (lease: AliasLease): void => {
       if (!lease.active) return
       lease.active = false
-      if (aliasesByBody.get(lease.key) === lease) {
-        aliasesByBody.delete(lease.key)
+      if (aliasesByFingerprint.get(lease.key) === lease) {
+        aliasesByFingerprint.delete(lease.key)
       }
       clearAliasLeaseTimer(lease)
       lease.aliases.dispose()
@@ -347,8 +375,12 @@ export default Plugin.define({
       body: string,
       aliases: ToolNameAliasTable,
     ): void => {
-      const key = requestBodyKey(body)
-      const existing = aliasesByBody.get(key)
+      const key = requestLeaseKey(ownershipKey, request, body)
+      if (!key) {
+        aliases.dispose()
+        throw new Error('Unable to track transformed Anthropic request')
+      }
+      const existing = aliasesByFingerprint.get(key)
       if (existing?.active) {
         aliases.dispose()
         existing.references += 1
@@ -356,7 +388,7 @@ export default Plugin.define({
         scheduleAliasLeaseExpiry(existing)
         return
       }
-      if (aliasesByBody.size >= MAX_ACTIVE_ALIAS_REQUESTS) {
+      if (aliasesByFingerprint.size >= MAX_ACTIVE_ALIAS_REQUESTS) {
         aliases.dispose()
         throw new Error('Too many active Anthropic tool-name alias mappings')
       }
@@ -369,7 +401,7 @@ export default Plugin.define({
         active: true,
         timer: undefined,
       }
-      aliasesByBody.set(key, lease)
+      aliasesByFingerprint.set(key, lease)
       aliasesByRequest.set(request, lease)
       scheduleAliasLeaseExpiry(lease)
     }
@@ -385,27 +417,36 @@ export default Plugin.define({
       if (direct) aliasesByRequest.delete(request)
       if (!request.body) return undefined
       if (request.bodyUsed || request.body.locked) return undefined
-
-      const declaredLength = contentLength(request.headers)
-      if (
-        declaredLength !== undefined &&
-        declaredLength > MAX_REQUEST_BODY_BYTES
-      ) {
-        throw new BodyLimitError(
-          'Anthropic request body',
-          MAX_REQUEST_BODY_BYTES,
-        )
+      if (reconstructedAliasLookups >= MAX_RECONSTRUCTED_ALIAS_LOOKUPS) {
+        return undefined
       }
-      const body = await readBoundedText(
-        request.clone().body,
-        MAX_REQUEST_BODY_BYTES,
-        'Anthropic request body',
-      )
-      const lease = aliasesByBody.get(requestBodyKey(body))
-      if (!lease?.active) return undefined
-      beginAliasResponse(lease)
-      aliasesByRequest.set(request, lease)
-      return lease
+      reconstructedAliasLookups += 1
+      try {
+        const declaredLength = contentLength(request.headers)
+        if (
+          declaredLength !== undefined &&
+          declaredLength > MAX_REQUEST_BODY_BYTES
+        ) {
+          throw new BodyLimitError(
+            'Anthropic request body',
+            MAX_REQUEST_BODY_BYTES,
+          )
+        }
+        const body = await readBoundedText(
+          request.clone().body,
+          MAX_REQUEST_BODY_BYTES,
+          'Anthropic request body',
+        )
+        const key = requestLeaseKey(ownershipKey, request, body)
+        if (!key) return undefined
+        const lease = aliasesByFingerprint.get(key)
+        if (!lease?.active) return undefined
+        beginAliasResponse(lease)
+        aliasesByRequest.set(request, lease)
+        return lease
+      } finally {
+        reconstructedAliasLookups -= 1
+      }
     }
 
     // Retain successful refreshes for this location so a host call
@@ -611,29 +652,36 @@ export default Plugin.define({
         redirect: 'error',
       })
 
-      if (
-        pathname === '/v1/messages' &&
-        rewrittenBody !== undefined &&
-        aliases.hasStatefulAliases
-      ) {
-        registerAliasLease(rewrittenRequest, rewrittenBody, aliases)
+      event.request = rewrittenRequest
+      if (pathname === '/v1/messages' && rewrittenBody !== undefined) {
+        try {
+          registerAliasLease(event.request, rewrittenBody, aliases)
+        } catch (error) {
+          event.request = request
+          throw error
+        }
       } else {
         aliases.dispose()
       }
-      rememberConnection(rewrittenRequest, connectionDescription)
-      event.request = rewrittenRequest
+      if (pathname === '/v1/messages') {
+        transformedRequests.add(event.request)
+      }
+      rememberConnection(event.request, connectionDescription)
     })
 
     await ctx.session.hook('http.response', async (event) => {
       if (event.model.providerID !== INTEGRATION_ID) return
-      if (!isTransformedOAuthRequest(event.request)) return
+      if (!hasTransformedOAuthShape(event.request)) return
+      const ownedDirectly = transformedRequests.has(event.request)
+      let lease: AliasLease | undefined
+      try {
+        lease = await resolveAliasLease(event.request)
+      } catch {
+        if (!ownedDirectly) return
+        // A direct plugin-owned response survives a best-effort lease failure.
+      }
+      if (!ownedDirectly && !lease) return
       if (!event.response.ok) {
-        let lease: AliasLease | undefined
-        try {
-          lease = await resolveAliasLease(event.request)
-        } catch {
-          // Error responses must remain passthrough even when cleanup lookup fails.
-        }
         if (lease) releaseAliasLease(event.request, lease)
         if (event.response.status === 429) {
           const enhanced = await enhanceRateLimitResponse(
@@ -643,12 +691,6 @@ export default Plugin.define({
           event.response = enhanced.response
         }
         return
-      }
-      let lease: AliasLease | undefined
-      try {
-        lease = await resolveAliasLease(event.request)
-      } catch {
-        // A successful response must survive a best-effort alias lookup failure.
       }
       const aliases =
         lease?.aliases ?? new ToolNameAliasTable({ maxEntries: 0, maxBytes: 0 })
@@ -671,8 +713,8 @@ export default Plugin.define({
     })
 
     return () => {
-      for (const lease of aliasesByBody.values()) expireAliasLease(lease)
-      aliasesByBody.clear()
+      for (const lease of aliasesByFingerprint.values()) expireAliasLease(lease)
+      aliasesByFingerprint.clear()
       for (const entry of connectionByAuthorization.values()) {
         clearTimeout(entry.timer)
       }
