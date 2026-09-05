@@ -1,3 +1,5 @@
+import { Buffer } from 'node:buffer'
+import { createHash } from 'node:crypto'
 import { buildBillingHeaderValue } from './cch.ts'
 import {
   CLAUDE_CODE_ENTRYPOINT,
@@ -11,12 +13,205 @@ import {
 } from './constants.ts'
 import {
   createBoundedJsonToolNameStream,
+  MAX_JSON_NODES,
+  MAX_JSON_OBJECT_KEYS,
   MAX_JSON_TOOL_NAME_BYTES,
 } from './json-response-stream.ts'
 
 // Bound an incomplete SSE line so malformed streams cannot grow memory forever.
 export const MAX_SSE_LINE_BYTES = 5 * 1024 * 1024
+export const MAX_SSE_EVENT_BYTES = 8 * 1024 * 1024
 export { MAX_JSON_TOOL_NAME_BYTES }
+
+const SHORT_TOOL_ALIAS_PREFIX = `${TOOL_PREFIX}T`
+const LONG_TOOL_ALIAS_PREFIX = `${TOOL_PREFIX}H`
+const MAX_TOOL_ALIAS_BYTES = 64
+const MAX_INLINE_TOOL_NAME_BYTES = 44
+const DEFAULT_ALIAS_ENTRIES = 4096
+const DEFAULT_ALIAS_BYTES = 256 * 1024
+const utf8Encoder = new TextEncoder()
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
+
+type ToolNameAliasOptions = {
+  maxEntries?: number
+  maxBytes?: number
+}
+
+function base64url(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('base64url')
+}
+
+function assertWellFormedUtf16(value: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index)
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      if (index + 1 >= value.length) {
+        throw new Error('Tool names must contain well-formed UTF-16')
+      }
+      const next = value.charCodeAt(index + 1)
+      if (next < 0xdc00 || next > 0xdfff) {
+        throw new Error('Tool names must contain well-formed UTF-16')
+      }
+      index += 1
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new Error('Tool names must contain well-formed UTF-16')
+    }
+  }
+}
+
+/**
+ * Reversible tool-name aliases bounded to Anthropic's 64-byte limit.
+ *
+ * Names up to 44 UTF-8 bytes are encoded inline. Longer names use a stable
+ * SHA-256 alias and are retained in a bounded table because a lossless,
+ * stateless 64-byte source -> 60-byte payload mapping is impossible.
+ */
+export class ToolNameAliasTable {
+  private readonly maxEntries: number
+  private readonly maxBytes: number
+  private readonly longByName = new Map<string, string>()
+  private readonly longByAlias = new Map<string, string>()
+  private retainedBytes = 0
+  private disposed = false
+
+  constructor(options: ToolNameAliasOptions = {}) {
+    this.maxEntries = options.maxEntries ?? DEFAULT_ALIAS_ENTRIES
+    this.maxBytes = options.maxBytes ?? DEFAULT_ALIAS_BYTES
+    if (
+      !Number.isSafeInteger(this.maxEntries) ||
+      this.maxEntries < 0 ||
+      !Number.isSafeInteger(this.maxBytes) ||
+      this.maxBytes < 0
+    ) {
+      throw new TypeError(
+        'Tool-name alias limits must be safe non-negative integers',
+      )
+    }
+  }
+
+  private assertActive(): void {
+    if (this.disposed) throw new Error('Tool-name alias table is disposed')
+  }
+
+  encode(name: string): string {
+    this.assertActive()
+    assertWellFormedUtf16(name)
+    const bytes = utf8Encoder.encode(name)
+    if (bytes.byteLength === 0) {
+      throw new Error('Tool names must not be empty')
+    }
+
+    if (bytes.byteLength <= MAX_INLINE_TOOL_NAME_BYTES) {
+      const alias = `${SHORT_TOOL_ALIAS_PREFIX}${base64url(bytes)}`
+      if (utf8Encoder.encode(alias).byteLength > MAX_TOOL_ALIAS_BYTES) {
+        throw new Error('Encoded tool name exceeds Anthropic alias limit')
+      }
+      return alias
+    }
+
+    const existing = this.longByName.get(name)
+    if (existing) return existing
+
+    const alias = `${LONG_TOOL_ALIAS_PREFIX}${createHash('sha256')
+      .update(bytes)
+      .digest('base64url')}`
+    const collision = this.longByAlias.get(alias)
+    if (collision !== undefined && collision !== name) {
+      throw new Error('Tool-name alias collision')
+    }
+    if (this.longByName.size >= this.maxEntries) {
+      throw new Error('Tool-name alias entry limit exceeded')
+    }
+    if (bytes.byteLength > this.maxBytes - this.retainedBytes) {
+      throw new Error('Tool-name alias byte limit exceeded')
+    }
+
+    this.longByName.set(name, alias)
+    this.longByAlias.set(alias, name)
+    this.retainedBytes += bytes.byteLength
+    return alias
+  }
+
+  decode(alias: string): string | undefined {
+    this.assertActive()
+    if (alias.startsWith(SHORT_TOOL_ALIAS_PREFIX)) {
+      const encoded = alias.slice(SHORT_TOOL_ALIAS_PREFIX.length)
+      if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) return undefined
+      try {
+        const bytes = Buffer.from(encoded, 'base64url')
+        if (bytes.byteLength > MAX_INLINE_TOOL_NAME_BYTES) return undefined
+        if (base64url(bytes) !== encoded) return undefined
+        const name = utf8Decoder.decode(bytes)
+        const canonical = `${SHORT_TOOL_ALIAS_PREFIX}${base64url(
+          utf8Encoder.encode(name),
+        )}`
+        return canonical === alias ? name : undefined
+      } catch {
+        return undefined
+      }
+    }
+    if (alias.startsWith(LONG_TOOL_ALIAS_PREFIX)) {
+      return this.longByAlias.get(alias)
+    }
+    return undefined
+  }
+
+  get hasStatefulAliases(): boolean {
+    this.assertActive()
+    return this.longByName.size > 0
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.longByName.clear()
+    this.longByAlias.clear()
+    this.retainedBytes = 0
+  }
+}
+
+function statelessToolNameAliases(): ToolNameAliasTable {
+  return new ToolNameAliasTable({ maxEntries: 0, maxBytes: 0 })
+}
+
+function finalizeStream(
+  stream: ReadableStream<Uint8Array>,
+  finalize: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = stream.getReader()
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true
+    reader.releaseLock()
+  }
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const result = await reader.read()
+        if (result.done) {
+          release()
+          finalize()
+          controller.close()
+        } else {
+          controller.enqueue(result.value)
+        }
+      } catch (error) {
+        release()
+        finalize()
+        controller.error(error)
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason)
+      } finally {
+        release()
+        finalize()
+      }
+    },
+  })
+}
 
 export function headersAfterBodyTransform(source: Headers): Headers {
   const headers = new Headers(source)
@@ -32,26 +227,6 @@ export function headersAfterBodyTransform(source: Headers): Headers {
     headers.delete(name)
   }
   return headers
-}
-
-/**
- * Prefix a tool name with TOOL_PREFIX and uppercase the first character.
- * Claude Code uses PascalCase tool names (e.g. mcp_Bash, mcp_Read);
- * lowercase names (mcp_bash, mcp_read) are flagged as non-Claude-Code clients.
- */
-function prefixName(name: string): string {
-  return `${TOOL_PREFIX}${name.charAt(0).toUpperCase()}${name.slice(1)}`
-}
-
-/**
- * Reverse prefixName: strip TOOL_PREFIX and restore the original leading case.
- */
-function unprefixName(name: string): string {
-  // StructuredOutput is still used as StructuredOutput
-  if (name === 'StructuredOutput') {
-    return name
-  }
-  return `${name.charAt(0).toLowerCase()}${name.slice(1)}`
 }
 
 export type FetchInput = string | URL | Request
@@ -126,37 +301,39 @@ export function setOAuthHeaders(
  * Add TOOL_PREFIX to tool names in the request body.
  * Prefixes both tool definitions and tool_use blocks in messages.
  */
-export function prefixToolNames(parsed: Record<string, unknown>): string {
+export function prefixToolNames(
+  parsed: Record<string, unknown>,
+  alreadyPrefixed = false,
+  aliases: ToolNameAliasTable = statelessToolNameAliases(),
+): string {
+  const prefix = (name: string) =>
+    alreadyPrefixed && name.startsWith(TOOL_PREFIX)
+      ? name
+      : aliases.encode(name)
+
   if (parsed.tools && Array.isArray(parsed.tools)) {
-    parsed.tools = parsed.tools.map(
-      (tool: { name?: string; [k: string]: unknown }) => ({
-        ...tool,
-        name: tool.name ? prefixName(tool.name) : tool.name,
-      }),
+    parsed.tools = parsed.tools.map((tool) =>
+      isRecord(tool) && typeof tool.name === 'string' && tool.name.length > 0
+        ? { ...tool, name: prefix(tool.name) }
+        : tool,
     )
   }
 
   if (parsed.messages && Array.isArray(parsed.messages)) {
-    parsed.messages = parsed.messages.map(
-      (msg: {
-        content?: Array<{
-          type: string
-          name?: string
-          [k: string]: unknown
-        }>
-        [k: string]: unknown
-      }) => {
-        if (msg.content && Array.isArray(msg.content)) {
-          msg.content = msg.content.map((block) => {
-            if (block.type === 'tool_use' && block.name) {
-              return { ...block, name: prefixName(block.name) }
-            }
-            return block
-          })
-        }
-        return msg
-      },
-    )
+    parsed.messages = parsed.messages.map((message) => {
+      if (!isRecord(message) || !Array.isArray(message.content)) return message
+      return {
+        ...message,
+        content: message.content.map((block) =>
+          isRecord(block) &&
+          block.type === 'tool_use' &&
+          typeof block.name === 'string' &&
+          block.name.length > 0
+            ? { ...block, name: prefix(block.name) }
+            : block,
+        ),
+      }
+    })
   }
 
   return JSON.stringify(parsed)
@@ -165,10 +342,16 @@ export function prefixToolNames(parsed: Record<string, unknown>): string {
 /**
  * Strip TOOL_PREFIX from tool names in streaming response text.
  */
-export function stripToolPrefix(text: string): string {
+export function stripToolPrefix(
+  text: string,
+  aliases: ToolNameAliasTable = statelessToolNameAliases(),
+): string {
   return text.replace(
-    /"name"\s*:\s*"mcp_([^"]+)"/g,
-    (_match, name: string) => `"name": "${unprefixName(name)}"`,
+    /"name"\s*:\s*"(mcp_[A-Za-z0-9_-]+)"/g,
+    (match, alias: string) => {
+      const name = aliases.decode(alias)
+      return name === undefined ? match : `"name": ${JSON.stringify(name)}`
+    },
   )
 }
 
@@ -179,10 +362,12 @@ type JsonReplacement = {
   value: string
 }
 
-const MAX_RESPONSE_JSON_NODES = 100_000
 const MAX_RESPONSE_JSON_DEPTH = 256
 
-function isToolUse(value: unknown): value is Record<string, unknown> & {
+function isToolUseWithAlias(value: unknown): value is Record<
+  string,
+  unknown
+> & {
   name: string
 } {
   return (
@@ -193,16 +378,30 @@ function isToolUse(value: unknown): value is Record<string, unknown> & {
   )
 }
 
-function responseToolNameReplacements(value: unknown): JsonReplacement[] {
+function validateResponseToolName(name: string): void {
+  assertWellFormedUtf16(name)
+  if (utf8Encoder.encode(name).byteLength > MAX_JSON_TOOL_NAME_BYTES) {
+    throw new Error(
+      `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`,
+    )
+  }
+}
+
+function responseToolNameReplacements(
+  value: unknown,
+  aliases: ToolNameAliasTable,
+): JsonReplacement[] {
   if (!isRecord(value)) return []
 
-  if (value.type === 'content_block_start' && isToolUse(value.content_block)) {
-    return [
-      {
-        path: ['content_block', 'name'],
-        value: unprefixName(value.content_block.name.slice(TOOL_PREFIX.length)),
-      },
-    ]
+  if (
+    value.type === 'content_block_start' &&
+    isToolUseWithAlias(value.content_block)
+  ) {
+    validateResponseToolName(value.content_block.name)
+    const name = aliases.decode(value.content_block.name)
+    return name === undefined
+      ? []
+      : [{ path: ['content_block', 'name'], value: name }]
   }
 
   if (value.type !== 'message' || !Array.isArray(value.content)) return []
@@ -210,11 +409,12 @@ function responseToolNameReplacements(value: unknown): JsonReplacement[] {
   const replacements: JsonReplacement[] = []
   for (let index = 0; index < value.content.length; index++) {
     const block = value.content[index]
-    if (!isToolUse(block)) continue
-    replacements.push({
-      path: ['content', index, 'name'],
-      value: unprefixName(block.name.slice(TOOL_PREFIX.length)),
-    })
+    if (!isToolUseWithAlias(block)) continue
+    validateResponseToolName(block.name)
+    const name = aliases.decode(block.name)
+    if (name !== undefined) {
+      replacements.push({ path: ['content', index, 'name'], value: name })
+    }
   }
   return replacements
 }
@@ -227,8 +427,6 @@ function rewriteJsonStringTokens(
   text: string,
   replacements: JsonReplacement[],
 ): string {
-  if (replacements.length === 0) return text
-
   const wanted = new Map(
     replacements.map((replacement) => [
       pathKey(replacement.path),
@@ -237,6 +435,7 @@ function rewriteJsonStringTokens(
   )
   const edits = new Map<string, { start: number; end: number; value: string }>()
   let visited = 0
+  let objectKeys = 0
 
   function failLimits() {
     throw new Error('Anthropic response JSON exceeds traversal limits')
@@ -260,7 +459,7 @@ function rewriteJsonStringTokens(
 
   function walkValue(offset: number, path: JsonPath, depth: number): number {
     visited++
-    if (visited > MAX_RESPONSE_JSON_NODES || depth > MAX_RESPONSE_JSON_DEPTH) {
+    if (visited > MAX_JSON_NODES || depth > MAX_RESPONSE_JSON_DEPTH) {
       failLimits()
     }
 
@@ -278,10 +477,21 @@ function rewriteJsonStringTokens(
 
     if (char === '{') {
       cursor = skipWhitespace(cursor + 1)
+      const seenKeys = new Set<string>()
       while (text[cursor] !== '}' && cursor < text.length) {
         const keyStart = cursor
         const keyEnd = scanString(keyStart)
         const key: string = JSON.parse(text.slice(keyStart, keyEnd))
+        objectKeys += 1
+        if (objectKeys > MAX_JSON_OBJECT_KEYS) {
+          throw new Error('Anthropic response JSON exceeds object-key limit')
+        }
+        if (seenKeys.has(key)) {
+          throw new Error(
+            `Malformed Anthropic response JSON: duplicate object key: ${key}`,
+          )
+        }
+        seenKeys.add(key)
         cursor = skipWhitespace(keyEnd)
         cursor = skipWhitespace(cursor + 1)
         cursor = walkValue(cursor, [...path, key], depth + 1)
@@ -321,7 +531,10 @@ function rewriteJsonStringTokens(
   return output
 }
 
-function rewriteResponseJson(text: string): string | undefined {
+function rewriteResponseJson(
+  text: string,
+  aliases: ToolNameAliasTable,
+): string | undefined {
   let value: unknown
   try {
     value = JSON.parse(text)
@@ -329,31 +542,188 @@ function rewriteResponseJson(text: string): string | undefined {
     return undefined
   }
 
-  return rewriteJsonStringTokens(text, responseToolNameReplacements(value))
+  return rewriteJsonStringTokens(
+    text,
+    responseToolNameReplacements(value, aliases),
+  )
 }
 
-function stripResponseToolPrefix(text: string): string {
-  if (!text.includes('mcp_')) return text
+type SseLine = {
+  readonly content: string
+  readonly ending: string
+}
 
-  let first = 0
-  while (first < text.length) {
-    const code = text.charCodeAt(first)
-    if (code !== 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) break
-    first++
+function splitSseLines(event: string): SseLine[] {
+  const lines: SseLine[] = []
+  let offset = 0
+  while (offset < event.length) {
+    let cursor = offset
+    while (
+      cursor < event.length &&
+      event[cursor] !== '\r' &&
+      event[cursor] !== '\n'
+    ) {
+      cursor += 1
+    }
+    let ending = ''
+    if (event[cursor] === '\r' && event[cursor + 1] === '\n') ending = '\r\n'
+    else if (event[cursor] === '\r') ending = '\r'
+    else if (event[cursor] === '\n') ending = '\n'
+    lines.push({ content: event.slice(offset, cursor), ending })
+    offset = cursor + ending.length
   }
-  const firstCode = text.charCodeAt(first)
-  if (firstCode === 0x7b || firstCode === 0x5b) {
-    const document = rewriteResponseJson(text)
-    if (document !== undefined) return document
+  return lines
+}
+
+function sseDataValue(line: string): string | undefined {
+  if (line === 'data') return ''
+  if (!line.startsWith('data:')) return undefined
+  const value = line.slice('data:'.length)
+  return value.startsWith(' ') ? value.slice(1) : value
+}
+
+function transformSseEvent(
+  bytes: Uint8Array,
+  aliases: ToolNameAliasTable,
+): Uint8Array {
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  const encoder = new TextEncoder()
+  const event = decoder.decode(bytes)
+
+  const lines = splitSseLines(event)
+  const dataIndexes: number[] = []
+  const dataValues: string[] = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const value = sseDataValue(lines[index]?.content ?? '')
+    if (value === undefined) continue
+    dataIndexes.push(index)
+    dataValues.push(value)
+  }
+  if (dataIndexes.length === 0) return bytes
+
+  const payload = dataValues.join('\n')
+  if (payload.trim() === '[DONE]') return bytes
+  const firstPayloadCharacter = payload.trimStart()[0]
+  const jsonLooking =
+    firstPayloadCharacter === '{' || firstPayloadCharacter === '['
+  if (!payload.includes(TOOL_PREFIX) && !jsonLooking) return bytes
+
+  const rewritten = rewriteResponseJson(payload, aliases)
+  if (rewritten === undefined) {
+    if (jsonLooking) {
+      throw new Error('Malformed or truncated Anthropic response JSON')
+    }
+    return bytes
+  }
+  if (rewritten === payload) return bytes
+  const canonical =
+    /[\r\n]/.test(rewritten) || dataIndexes.length > 1
+      ? JSON.stringify(JSON.parse(rewritten))
+      : rewritten
+  const firstIndex = dataIndexes[0]
+  const dataIndexSet = new Set(dataIndexes)
+  const output = lines
+    .map((line, index) => {
+      if (index === firstIndex) return `data: ${canonical}${line.ending}`
+      if (dataIndexSet.has(index)) return ''
+      return `${line.content}${line.ending}`
+    })
+    .join('')
+  return encoder.encode(output)
+}
+
+function createBoundedSseToolNameStream(
+  body: ReadableStream<Uint8Array>,
+  aliases: ToolNameAliasTable,
+): ReadableStream<Uint8Array> {
+  let event = new Uint8Array(1024)
+  let eventLength = 0
+  let lineLength = 0
+  let pendingCr = false
+
+  const appendEvent = (bytes: Uint8Array): void => {
+    const required = eventLength + bytes.byteLength
+    if (required > MAX_SSE_EVENT_BYTES) {
+      throw new Error(`SSE event exceeds ${MAX_SSE_EVENT_BYTES} byte limit`)
+    }
+    if (required > event.byteLength) {
+      let capacity = event.byteLength
+      while (capacity < required) {
+        capacity = Math.min(MAX_SSE_EVENT_BYTES, capacity * 2)
+      }
+      const expanded = new Uint8Array(capacity)
+      expanded.set(event.subarray(0, eventLength))
+      event = expanded
+    }
+    event.set(bytes, eventLength)
+    eventLength = required
   }
 
-  return text.replace(
-    /(^|[\r\n])(data:[ \t]*)([^\r\n]*)/g,
-    (line, lineStart: string, field: string, payload: string) => {
-      if (!payload.includes('mcp_')) return line
-      const rewritten = rewriteResponseJson(payload)
-      return rewritten === undefined ? line : `${lineStart}${field}${rewritten}`
-    },
+  const appendContent = (bytes: Uint8Array): void => {
+    if (lineLength + bytes.byteLength > MAX_SSE_LINE_BYTES) {
+      throw new Error(`SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`)
+    }
+    lineLength += bytes.byteLength
+    appendEvent(bytes)
+  }
+
+  const dispatch = (
+    controller: TransformStreamDefaultController<Uint8Array>,
+  ): void => {
+    if (eventLength === 0) return
+    controller.enqueue(transformSseEvent(event.slice(0, eventLength), aliases))
+    eventLength = 0
+  }
+
+  const finishLine = (
+    controller: TransformStreamDefaultController<Uint8Array>,
+  ): void => {
+    const blank = lineLength === 0
+    lineLength = 0
+    if (blank) dispatch(controller)
+  }
+
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        let segmentStart = 0
+        if (pendingCr) {
+          pendingCr = false
+          if (chunk[0] === 0x0a) {
+            appendEvent(chunk.subarray(0, 1))
+            segmentStart = 1
+          }
+          finishLine(controller)
+        }
+
+        for (let index = segmentStart; index < chunk.byteLength; index += 1) {
+          const byte = chunk[index]
+          if (byte !== 0x0d && byte !== 0x0a) continue
+
+          appendContent(chunk.subarray(segmentStart, index))
+          appendEvent(chunk.subarray(index, index + 1))
+          if (byte === 0x0d && index + 1 === chunk.byteLength) {
+            pendingCr = true
+            segmentStart = index + 1
+            break
+          }
+          if (byte === 0x0d && chunk[index + 1] === 0x0a) {
+            appendEvent(chunk.subarray(index + 1, index + 2))
+            index += 1
+          }
+          finishLine(controller)
+          segmentStart = index + 1
+        }
+        appendContent(chunk.subarray(segmentStart))
+      },
+      flush(controller) {
+        if (pendingCr) {
+          pendingCr = false
+          finishLine(controller)
+        }
+        dispatch(controller)
+      },
+    }),
   )
 }
 
@@ -473,21 +843,31 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
 
   if (typeof system === 'string') {
     const sanitized = sanitizeSystemText(system)
-    if (sanitized === CLAUDE_CODE_IDENTITY) return [identityBlock]
+    if (!sanitized || sanitized === CLAUDE_CODE_IDENTITY) {
+      return [identityBlock]
+    }
     return [identityBlock, { type: 'text', text: sanitized }]
   }
 
   if (isRecord(system)) {
-    const type = typeof system.type === 'string' ? system.type : 'text'
-    const text = typeof system.text === 'string' ? system.text : ''
-    return [identityBlock, { ...system, type, text: sanitizeSystemText(text) }]
+    if (system.type !== 'text' || typeof system.text !== 'string') {
+      return [identityBlock]
+    }
+    const text = sanitizeSystemText(system.text)
+    if (!text || text === CLAUDE_CODE_IDENTITY) return [identityBlock]
+    return [identityBlock, { ...system, type: 'text', text }]
   }
 
   if (!Array.isArray(system)) return [identityBlock]
 
-  const sanitized: SystemBlock[] = system.map((item: unknown) => {
+  const sanitized: SystemBlock[] = []
+  for (const item of system) {
     if (typeof item === 'string') {
-      return { type: 'text', text: sanitizeSystemText(item) }
+      const text = sanitizeSystemText(item)
+      if (text && text !== CLAUDE_CODE_IDENTITY) {
+        sanitized.push({ type: 'text', text })
+      }
+      continue
     }
 
     if (
@@ -495,72 +875,119 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
       item.type === 'text' &&
       typeof item.text === 'string'
     ) {
-      return {
-        ...item,
-        type: 'text',
-        text: sanitizeSystemText(item.text),
+      const text = sanitizeSystemText(item.text)
+      if (text && text !== CLAUDE_CODE_IDENTITY) {
+        sanitized.push({ ...item, type: 'text', text })
       }
     }
-
-    return { type: 'text', text: String(item) }
-  })
-
-  // Idempotency: don't double-prepend if first block already has the identity
-  if (sanitized[0]?.text === CLAUDE_CODE_IDENTITY) {
-    return sanitized
   }
 
   return [identityBlock, ...sanitized]
 }
 
+const BILLING_HEADER_PREFIX = 'x-anthropic-billing-header:'
+
+function isBillingBlock(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    value.type === 'text' &&
+    typeof value.text === 'string' &&
+    value.text.startsWith(BILLING_HEADER_PREFIX)
+  )
+}
+
+function hasRewriteMarker(parsed: Record<string, unknown>): boolean {
+  if (!Array.isArray(parsed.system)) return false
+  const hasIdentity = parsed.system.some(
+    (block) => isRecord(block) && block.text === CLAUDE_CODE_IDENTITY,
+  )
+  if (!hasIdentity) return false
+  const hasUser =
+    Array.isArray(parsed.messages) &&
+    parsed.messages.some(
+      (message) => isRecord(message) && message.role === 'user',
+    )
+  return !hasUser || parsed.system.some(isBillingBlock)
+}
+
 /**
  * Rewrite the full request body: sanitize system prompt and prefix tool names.
  */
-export function rewriteRequestBody(body: string): string {
+export function rewriteRequestBody(
+  body: string,
+  aliases: ToolNameAliasTable = statelessToolNameAliases(),
+): string {
+  let value: unknown
   try {
-    const parsed = JSON.parse(body)
-    const billingHeader =
-      Array.isArray(parsed.messages) &&
-      parsed.messages.some(
-        (message: { role?: string }) => message.role === 'user',
-      )
-        ? buildBillingHeaderValue(
-            parsed.messages,
-            undefined,
-            CLAUDE_CODE_ENTRYPOINT,
-          )
-        : null
-
-    // Sanitize system prompt and prepend Claude Code identity
-    parsed.system = prependClaudeCodeIdentity(parsed.system)
-
-    // Prepend the billing header as a separate system block so the
-    // final layout is: [billing header, identity, ...rest]
-    if (billingHeader && Array.isArray(parsed.system)) {
-      parsed.system.unshift({ type: 'text', text: billingHeader })
-    }
-
-    return prefixToolNames(parsed)
+    value = JSON.parse(body)
   } catch {
     return body
   }
+  if (!isRecord(value)) return body
+  const parsed = value
+  const alreadyPrefixed = hasRewriteMarker(parsed)
+
+  const billingHeader =
+    Array.isArray(parsed.messages) &&
+    parsed.messages.some(
+      (message) => isRecord(message) && message.role === 'user',
+    )
+      ? buildBillingHeaderValue(
+          parsed.messages,
+          undefined,
+          CLAUDE_CODE_ENTRYPOINT,
+        )
+      : null
+
+  // Sanitize system prompt and prepend Claude Code identity
+  const system = prependClaudeCodeIdentity(parsed.system).filter(
+    (block) => !isBillingBlock(block),
+  )
+
+  // Prepend the billing header as a separate system block so the
+  // final layout is: [billing header, identity, ...rest]
+  if (billingHeader) {
+    system.unshift({ type: 'text', text: billingHeader })
+  }
+  parsed.system = system
+
+  return prefixToolNames(parsed, alreadyPrefixed, aliases)
 }
 
 /**
  * Create a streaming response that strips the tool prefix from tool names.
  */
-export function createStrippedStream(response: Response): Response {
+export function createStrippedStream(
+  response: Response,
+  aliases: ToolNameAliasTable = statelessToolNameAliases(),
+  onFinalize: () => void = () => {},
+): Response {
+  let finalized = false
+  const finalize = () => {
+    if (finalized) return
+    finalized = true
+    onFinalize()
+  }
+
+  if (!response.ok) {
+    finalize()
+    return response
+  }
   const mediaType = response.headers
     .get('content-type')
     ?.split(';', 1)[0]
     ?.trim()
     .toLowerCase()
-  if (!response.body) return response
+  if (!response.body) {
+    finalize()
+    return response
+  }
   if (mediaType === 'application/json' || mediaType?.endsWith('+json')) {
-    const stream = createBoundedJsonToolNameStream(
-      response.body,
-      TOOL_PREFIX,
-      unprefixName,
+    const stream = finalizeStream(
+      createBoundedJsonToolNameStream(response.body, TOOL_PREFIX, (alias) =>
+        aliases.decode(alias),
+      ),
+      finalize,
     )
     const headers = headersAfterBodyTransform(response.headers)
     return new Response(stream, {
@@ -569,75 +996,14 @@ export function createStrippedStream(response: Response): Response {
       headers,
     })
   }
-  if (mediaType !== 'text/event-stream') return response
-
-  const decoder = new TextDecoder('utf-8', { fatal: true })
-  const encoder = new TextEncoder()
-  let pending = new Uint8Array(0)
-  let pendingLength = 0
-
-  const appendPending = (bytes: Uint8Array) => {
-    const requiredLength = pendingLength + bytes.byteLength
-    if (requiredLength > MAX_SSE_LINE_BYTES) {
-      throw new Error(`SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`)
-    }
-
-    if (requiredLength > pending.byteLength) {
-      let capacity = Math.max(1024, pending.byteLength)
-      while (capacity < requiredLength) {
-        capacity = Math.min(MAX_SSE_LINE_BYTES, capacity * 2)
-      }
-      const expanded = new Uint8Array(capacity)
-      expanded.set(pending.subarray(0, pendingLength))
-      pending = expanded
-    }
-
-    pending.set(bytes, pendingLength)
-    pendingLength = requiredLength
+  if (mediaType !== 'text/event-stream') {
+    finalize()
+    return response
   }
 
-  const stream = response.body.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        let lastLineBreak = -1
-        let lineLength = pendingLength
-        for (let index = 0; index < chunk.byteLength; index++) {
-          if (chunk[index] === 0x0a || chunk[index] === 0x0d) {
-            lastLineBreak = index
-            lineLength = 0
-          } else {
-            lineLength++
-            if (lineLength > MAX_SSE_LINE_BYTES) {
-              throw new Error(
-                `SSE line exceeds ${MAX_SSE_LINE_BYTES} byte limit`,
-              )
-            }
-          }
-        }
-
-        if (lastLineBreak < 0) {
-          appendPending(chunk)
-          return
-        }
-
-        const completeLines =
-          decoder.decode(pending.subarray(0, pendingLength), {
-            stream: true,
-          }) + decoder.decode(chunk.subarray(0, lastLineBreak + 1))
-
-        pendingLength = 0
-        appendPending(chunk.subarray(lastLineBreak + 1))
-        controller.enqueue(
-          encoder.encode(stripResponseToolPrefix(completeLines)),
-        )
-      },
-      flush(controller) {
-        const trailing = decoder.decode(pending.subarray(0, pendingLength))
-        if (trailing) {
-          controller.enqueue(encoder.encode(stripResponseToolPrefix(trailing)))
-        }
-      },
-    }),
+  const stream = finalizeStream(
+    createBoundedSseToolNameStream(response.body, aliases),
+    finalize,
   )
 
   const headers = headersAfterBodyTransform(response.headers)

@@ -42,11 +42,9 @@ function isTokenResponse(value: unknown): value is TokenResponse {
   if (!('expires_in' in value)) return false
   return (
     typeof value.refresh_token === 'string' &&
-    value.refresh_token.length > 0 &&
-    value.refresh_token.length <= MAX_TOKEN_LENGTH &&
+    isBoundedUtf8(value.refresh_token, MAX_TOKEN_LENGTH) &&
     typeof value.access_token === 'string' &&
-    value.access_token.length > 0 &&
-    value.access_token.length <= MAX_TOKEN_LENGTH &&
+    isBoundedUtf8(value.access_token, MAX_TOKEN_LENGTH) &&
     typeof value.expires_in === 'number' &&
     Number.isSafeInteger(value.expires_in) &&
     value.expires_in > 0
@@ -300,9 +298,9 @@ export type RefreshResult =
 
 /**
  * Exchange a refresh token for a new access/refresh token pair.
- * Retries transient (5xx, network) failures with exponential backoff;
- * non-transient failures (e.g. 403 on a revoked/rotated-away token)
- * are returned immediately as `{ type: 'failed' }`.
+ * Refresh tokens may rotate after a request reaches the provider. Retrying an
+ * ambiguous 5xx, timeout, network failure, or response-body failure can replay
+ * an already consumed token, so each call makes exactly one token request.
  */
 export async function refreshToken(
   refreshTokenValue: string,
@@ -311,61 +309,37 @@ export async function refreshToken(
     return { type: 'failed', status: 400 }
   }
 
-  const maxRetries = 2
-  const baseDelayMs = 500
+  try {
+    const response = await fetch(TOKEN_URL, {
+      method: 'POST',
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+      redirect: 'error',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/plain, */*',
+        'User-Agent': 'axios/1.13.6',
+      },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: refreshTokenValue,
+        client_id: CLIENT_ID,
+      }),
+    })
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delay = baseDelayMs * 2 ** (attempt - 1)
-        await new Promise((resolve) => setTimeout(resolve, delay))
-      }
-
-      const response = await fetch(TOKEN_URL, {
-        method: 'POST',
-        signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
-        redirect: 'error',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json, text/plain, */*',
-          'User-Agent': 'axios/1.13.6',
-        },
-        body: JSON.stringify({
-          grant_type: 'refresh_token',
-          refresh_token: refreshTokenValue,
-          client_id: CLIENT_ID,
-        }),
-      })
-
-      if (!response.ok) {
-        if (response.status >= 500 && attempt < maxRetries) {
-          await response.body?.cancel()
-          continue
-        }
-
-        await response.body?.cancel()
-        return { type: 'failed', status: response.status }
-      }
-
-      const tokens = await parseTokenResponse(response)
-      if (!tokens) {
-        return { type: 'failed', status: response.status }
-      }
-
-      return {
-        type: 'success',
-        ...tokens,
-      }
-    } catch (error) {
-      if (attempt < maxRetries && isTransientNetworkError(error)) {
-        continue
-      }
-
-      throw error
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {})
+      return { type: 'failed', status: response.status }
     }
-  }
 
-  // Unreachable — each iteration either returns or throws.
-  // Kept as a TypeScript exhaustiveness guard.
-  throw new Error('Token refresh exhausted all retries')
+    const tokens = await parseTokenResponse(response)
+    if (!tokens) return { type: 'failed', status: response.status }
+
+    return {
+      type: 'success',
+      ...tokens,
+    }
+  } catch (error) {
+    if (isTransientNetworkError(error)) return { type: 'failed', status: 0 }
+    throw error
+  }
 }

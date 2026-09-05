@@ -1,16 +1,24 @@
 import { type ParsedTokenInfo, Tokenizer, TokenType } from '@streamparser/json'
 
-export const MAX_JSON_TOOL_NAME_BYTES = 1024
+export const MAX_JSON_TOOL_NAME_BYTES = 64
 export const MAX_JSON_STRING_BYTES = 8 * 1024 * 1024
 export const MAX_JSON_NUMBER_BYTES = 128
 export const MAX_JSON_DEPTH = 256
+export const MAX_JSON_OBJECT_KEYS = 100_000
+export const MAX_JSON_NODES = 100_000
+export const MAX_JSON_PENDING_BLOCK_BYTES = 8 * 1024 * 1024
 
 const TOKENIZER_SLICE_BYTES = 1024
 const encoder = new TextEncoder()
 
 type ObjectState = 'key-or-end' | 'key' | 'colon' | 'value' | 'comma-or-end'
 type ArrayState = 'value-or-end' | 'value' | 'comma-or-end'
-type FrameRole = 'root' | 'content-array' | 'block' | 'other'
+type FrameRole =
+  | 'root'
+  | 'content-array'
+  | 'message-block'
+  | 'content-block'
+  | 'other'
 
 type ObjectFrame = {
   mode: 'object'
@@ -23,6 +31,7 @@ type ObjectFrame = {
   seenName: boolean
   seenContent: boolean
   seenContentBlock: boolean
+  seenKeys: Set<string>
 }
 
 type ArrayFrame = {
@@ -37,6 +46,14 @@ type PendingToken = {
   offset: number
   token: TokenType
   replacement?: Uint8Array
+}
+
+type DeferredName = {
+  readonly frame: ObjectFrame
+  readonly root: ObjectFrame
+  readonly offset: number
+  readonly tokenLength: number
+  readonly name: string
 }
 
 class ByteQueue {
@@ -106,6 +123,24 @@ function malformedJson(detail?: string): Error {
   )
 }
 
+function assertWellFormedUtf16(value: string): void {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index)
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      if (index + 1 >= value.length) {
+        throw new Error('Tool names must contain well-formed UTF-16')
+      }
+      const next = value.charCodeAt(index + 1)
+      if (next < 0xdc00 || next > 0xdfff) {
+        throw new Error('Tool names must contain well-formed UTF-16')
+      }
+      index += 1
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new Error('Tool names must contain well-formed UTF-16')
+    }
+  }
+}
+
 function rawTokenLength(bytes: Uint8Array, token: TokenType): number {
   if (token === TokenType.STRING) {
     let escaped = false
@@ -161,6 +196,7 @@ function objectFrame(role: FrameRole): ObjectFrame {
     seenName: false,
     seenContent: false,
     seenContentBlock: false,
+    seenKeys: new Set(),
   }
 }
 
@@ -174,17 +210,10 @@ function isPrimitive(token: TokenType): boolean {
   )
 }
 
-function enqueue(
-  controller: TransformStreamDefaultController<Uint8Array>,
-  bytes: Uint8Array,
-): void {
-  if (bytes.byteLength > 0) controller.enqueue(bytes)
-}
-
 export function createBoundedJsonToolNameStream(
   body: ReadableStream<Uint8Array>,
   toolPrefix: string,
-  rewriteName: (nameWithoutPrefix: string) => string,
+  rewriteName: (name: string) => string | undefined,
 ): ReadableStream<Uint8Array> {
   const raw = new ByteQueue()
   const stack: Frame[] = []
@@ -192,24 +221,129 @@ export function createBoundedJsonToolNameStream(
   let rootComplete = false
   let pending: PendingToken | undefined
   let outputController: TransformStreamDefaultController<Uint8Array>
+  let objectKeys = 0
+  let nodes = 0
+  let holdingOutput = false
+  let heldLength = 0
+  let heldChunks: Uint8Array[] = []
+  let deferredNames: DeferredName[] = []
 
   const top = (): Frame | undefined => stack.at(-1)
 
-  const expectingCandidateName = (): boolean => {
+  const countNode = (): void => {
+    nodes += 1
+    if (nodes > MAX_JSON_NODES) {
+      throw new Error('Anthropic response JSON exceeds traversal limits')
+    }
+  }
+
+  const rootFrame = (): ObjectFrame | undefined => {
+    const root = stack[0]
+    return root?.mode === 'object' && root.role === 'root' ? root : undefined
+  }
+
+  const emit = (bytes: Uint8Array): void => {
+    if (bytes.byteLength === 0) return
+    if (!holdingOutput) {
+      outputController.enqueue(bytes)
+      return
+    }
+    if (heldLength + bytes.byteLength > MAX_JSON_PENDING_BLOCK_BYTES) {
+      throw new Error(
+        `Anthropic response JSON exceeds ${MAX_JSON_PENDING_BLOCK_BYTES} byte pending-block limit`,
+      )
+    }
+    heldChunks.push(bytes)
+    heldLength += bytes.byteLength
+  }
+
+  const isSemanticToolUse = (frame: ObjectFrame, root: ObjectFrame): boolean =>
+    frame.objectType === 'tool_use' &&
+    ((frame.role === 'message-block' && root.objectType === 'message') ||
+      (frame.role === 'content-block' &&
+        root.objectType === 'content_block_start'))
+
+  const validateToolName = (name: string): void => {
+    assertWellFormedUtf16(name)
+    if (encoder.encode(name).byteLength > MAX_JSON_TOOL_NAME_BYTES) {
+      throw new Error(
+        `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`,
+      )
+    }
+  }
+
+  const resolveDeferredNames = (root: ObjectFrame): void => {
+    if (!holdingOutput) return
+    const held = new Uint8Array(heldLength)
+    let copied = 0
+    for (const chunk of heldChunks) {
+      held.set(chunk, copied)
+      copied += chunk.byteLength
+    }
+
+    const edits: Array<{
+      start: number
+      end: number
+      replacement: Uint8Array
+    }> = []
+    for (const deferred of deferredNames) {
+      if (deferred.root !== root || !isSemanticToolUse(deferred.frame, root)) {
+        continue
+      }
+      validateToolName(deferred.name)
+      if (!deferred.name.startsWith(toolPrefix)) continue
+      const rewritten = rewriteName(deferred.name)
+      if (rewritten === undefined) continue
+      edits.push({
+        start: deferred.offset,
+        end: deferred.offset + deferred.tokenLength,
+        replacement: encoder.encode(JSON.stringify(rewritten)),
+      })
+    }
+
+    let outputLength = held.byteLength
+    for (const edit of edits) {
+      outputLength += edit.replacement.byteLength - (edit.end - edit.start)
+    }
+    if (outputLength > MAX_JSON_PENDING_BLOCK_BYTES) {
+      throw new Error(
+        `Anthropic response JSON exceeds ${MAX_JSON_PENDING_BLOCK_BYTES} byte pending-block limit`,
+      )
+    }
+
+    const output = new Uint8Array(outputLength)
+    let sourceOffset = 0
+    let outputOffset = 0
+    for (const edit of edits.sort((left, right) => left.start - right.start)) {
+      output.set(held.subarray(sourceOffset, edit.start), outputOffset)
+      outputOffset += edit.start - sourceOffset
+      output.set(edit.replacement, outputOffset)
+      outputOffset += edit.replacement.byteLength
+      sourceOffset = edit.end
+    }
+    output.set(held.subarray(sourceOffset), outputOffset)
+    outputController.enqueue(output)
+    holdingOutput = false
+    heldLength = 0
+    heldChunks = []
+    deferredNames = []
+  }
+
+  const expectingConfirmedToolName = (): boolean => {
     const frame = top()
+    const root = rootFrame()
     return (
       frame?.mode === 'object' &&
-      frame.role === 'block' &&
+      root !== undefined &&
+      isSemanticToolUse(frame, root) &&
       frame.state === 'value' &&
-      frame.key === 'name' &&
-      frame.typeSeen &&
-      frame.objectType === 'tool_use'
+      frame.key === 'name'
     )
   }
 
   const finishPending = (nextOffset: number): void => {
     if (!pending) {
-      enqueue(outputController, raw.takeTo(nextOffset))
+      emit(raw.takeTo(nextOffset))
       return
     }
     const segmentStart = raw.start
@@ -217,7 +351,7 @@ export function createBoundedJsonToolNameStream(
     const tokenStart = pending.offset - segmentStart
     if (tokenStart < 0 || tokenStart > segment.byteLength) throw malformedJson()
     if (!pending.replacement) {
-      enqueue(outputController, segment)
+      emit(segment)
       pending = undefined
       return
     }
@@ -226,16 +360,21 @@ export function createBoundedJsonToolNameStream(
       pending.token,
     )
     if (tokenLength === 0) throw malformedJson('missing replacement token')
-    const output = new Uint8Array(
-      segment.byteLength - tokenLength + pending.replacement.byteLength,
-    )
+    const outputLength =
+      segment.byteLength - tokenLength + pending.replacement.byteLength
+    if (outputLength > MAX_JSON_PENDING_BLOCK_BYTES) {
+      throw new Error(
+        `Anthropic response JSON exceeds ${MAX_JSON_PENDING_BLOCK_BYTES} byte rewritten-segment limit`,
+      )
+    }
+    const output = new Uint8Array(outputLength)
     output.set(segment.subarray(0, tokenStart))
     output.set(pending.replacement, tokenStart)
     output.set(
       segment.subarray(tokenStart + tokenLength),
       tokenStart + pending.replacement.byteLength,
     )
-    enqueue(outputController, output)
+    emit(output)
     pending = undefined
   }
 
@@ -287,18 +426,14 @@ export function createBoundedJsonToolNameStream(
       parent.role === 'content-array' &&
       token === TokenType.LEFT_BRACE
     ) {
-      return 'block'
+      return 'message-block'
     }
     if (parent.mode !== 'object' || parent.role !== 'root') return 'other'
     if (parent.key === 'content' && token === TokenType.LEFT_BRACKET) {
-      if (!parent.typeSeen) throw malformedJson('content precedes root type')
-      return parent.objectType === 'message' ? 'content-array' : 'other'
+      return 'content-array'
     }
     if (parent.key === 'content_block' && token === TokenType.LEFT_BRACE) {
-      if (!parent.typeSeen) {
-        throw malformedJson('content_block precedes root type')
-      }
-      return parent.objectType === 'content_block_start' ? 'block' : 'other'
+      return 'content-block'
     }
     return 'other'
   }
@@ -307,6 +442,7 @@ export function createBoundedJsonToolNameStream(
     token: TokenType.LEFT_BRACE | TokenType.LEFT_BRACKET,
   ): void => {
     const parent = requireValuePosition()
+    countNode()
     if (stack.length >= MAX_JSON_DEPTH) {
       throw new Error('Anthropic response JSON exceeds traversal limits')
     }
@@ -319,6 +455,14 @@ export function createBoundedJsonToolNameStream(
   }
 
   const recordKey = (frame: ObjectFrame, key: string): void => {
+    objectKeys += 1
+    if (objectKeys > MAX_JSON_OBJECT_KEYS) {
+      throw new Error('Anthropic response JSON exceeds object-key limit')
+    }
+    if (frame.seenKeys.has(key)) {
+      throw malformedJson(`duplicate object key: ${key}`)
+    }
+    frame.seenKeys.add(key)
     if (frame.role === 'root') {
       if (key === 'type') {
         if (frame.seenType) throw malformedJson('duplicate root type')
@@ -332,7 +476,10 @@ export function createBoundedJsonToolNameStream(
         }
         frame.seenContentBlock = true
       }
-    } else if (frame.role === 'block') {
+    } else if (
+      frame.role === 'message-block' ||
+      frame.role === 'content-block'
+    ) {
       if (key === 'type') {
         if (frame.seenType) throw malformedJson('duplicate block type')
         frame.seenType = true
@@ -347,32 +494,51 @@ export function createBoundedJsonToolNameStream(
 
   const processPrimitive = (info: ParsedTokenInfo): Uint8Array | undefined => {
     const frame = requireValuePosition()
+    countNode()
     let replacement: Uint8Array | undefined
     if (frame?.mode === 'object') {
       if (
         frame.key === 'type' &&
-        (frame.role === 'root' || frame.role === 'block')
+        (frame.role === 'root' ||
+          frame.role === 'message-block' ||
+          frame.role === 'content-block')
       ) {
         frame.typeSeen = true
         frame.objectType =
           info.token === TokenType.STRING ? String(info.value) : undefined
       }
-      if (frame.role === 'block' && frame.key === 'name') {
-        if (!frame.typeSeen) throw malformedJson('name precedes block type')
-        if (
-          frame.objectType === 'tool_use' &&
-          info.token === TokenType.STRING
-        ) {
+      if (
+        (frame.role === 'message-block' || frame.role === 'content-block') &&
+        frame.key === 'name'
+      ) {
+        if (info.token === TokenType.STRING) {
           const name = String(info.value)
-          if (encoder.encode(name).byteLength > MAX_JSON_TOOL_NAME_BYTES) {
-            throw new Error(
-              `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`,
-            )
-          }
-          if (name.startsWith(toolPrefix)) {
-            replacement = encoder.encode(
-              JSON.stringify(rewriteName(name.slice(toolPrefix.length))),
-            )
+          const root = rootFrame()
+          if (!root) throw malformedJson('tool block has no object root')
+          if (frame.typeSeen && root.typeSeen) {
+            if (isSemanticToolUse(frame, root)) {
+              validateToolName(name)
+              if (name.startsWith(toolPrefix)) {
+                const rewritten = rewriteName(name)
+                if (rewritten !== undefined) {
+                  replacement = encoder.encode(JSON.stringify(rewritten))
+                }
+              }
+            }
+          } else {
+            if (!holdingOutput) holdingOutput = true
+            const source = raw.bytesFrom(info.offset)
+            const tokenLength = rawTokenLength(source, info.token)
+            if (tokenLength === 0) {
+              throw malformedJson('missing deferred name token')
+            }
+            deferredNames.push({
+              frame,
+              root,
+              offset: heldLength,
+              tokenLength,
+              name,
+            })
           }
         }
       }
@@ -397,23 +563,26 @@ export function createBoundedJsonToolNameStream(
         : frame.state === 'value-or-end' || frame.state === 'comma-or-end'
     if (!canClose) throw malformedJson('incomplete container')
     stack.pop()
+    if (frame.mode === 'object' && frame.role === 'root') {
+      resolveDeferredNames(frame)
+    }
     completeValue()
   }
 
   const onToken = (info: ParsedTokenInfo): void => {
     if (info.partial) {
       const sourceBytes = absoluteOffset - info.offset
-      const candidateNameBytes = expectingCandidateName()
+      const candidateNameBytes = expectingConfirmedToolName()
         ? encoder.encode(String(info.value)).byteLength
         : 0
       if (
         info.token === TokenType.STRING &&
-        (expectingCandidateName()
+        (expectingConfirmedToolName()
           ? candidateNameBytes > MAX_JSON_TOOL_NAME_BYTES
           : sourceBytes > MAX_JSON_STRING_BYTES)
       ) {
         throw new Error(
-          expectingCandidateName()
+          expectingConfirmedToolName()
             ? `JSON tool name exceeds ${MAX_JSON_TOOL_NAME_BYTES} byte limit`
             : `Anthropic response JSON exceeds ${MAX_JSON_STRING_BYTES} byte string limit`,
         )

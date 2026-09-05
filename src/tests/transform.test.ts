@@ -18,7 +18,12 @@ import {
   sanitizeSystemText,
   setOAuthHeaders,
   stripToolPrefix,
+  ToolNameAliasTable,
 } from '../transform'
+
+function shortAlias(name: string): string {
+  return `mcp_T${Buffer.from(new TextEncoder().encode(name)).toString('base64url')}`
+}
 
 describe('mergeHeaders', () => {
   test('copies headers from a Request object', () => {
@@ -140,6 +145,48 @@ describe('setOAuthHeaders', () => {
 })
 
 describe('prefixToolNames', () => {
+  test('preserves malformed tool and message entries without throwing', () => {
+    const aliases = new ToolNameAliasTable()
+    const body = {
+      tools: [null, 'not-a-tool', {}, { name: 'valid' }],
+      messages: [
+        null,
+        'not-a-message',
+        {},
+        { content: null },
+        {
+          content: [
+            'not-a-block',
+            null,
+            {},
+            { type: 'tool_use', name: 'valid' },
+          ],
+        },
+      ],
+    } as any
+
+    let rewritten = ''
+    expect(() => {
+      rewritten = prefixToolNames(body, false, aliases)
+    }).not.toThrow()
+    const result = JSON.parse(rewritten)
+    expect(result.tools.slice(0, 3)).toEqual([null, 'not-a-tool', {}])
+    expect(result.tools[3].name).toBe(shortAlias('valid'))
+    expect(result.messages.slice(0, 4)).toEqual([
+      null,
+      'not-a-message',
+      {},
+      { content: null },
+    ])
+    expect(result.messages[4].content.slice(0, 3)).toEqual([
+      'not-a-block',
+      null,
+      {},
+    ])
+    expect(result.messages[4].content[3].name).toBe(shortAlias('valid'))
+    aliases.dispose()
+  })
+
   test('prefixes tool definition names', () => {
     const body = {
       tools: [
@@ -148,8 +195,8 @@ describe('prefixToolNames', () => {
       ],
     }
     const result = JSON.parse(prefixToolNames(body))
-    expect(result.tools[0].name).toBe('mcp_Read_file')
-    expect(result.tools[1].name).toBe('mcp_Write_file')
+    expect(result.tools[0].name).toBe(shortAlias('read_file'))
+    expect(result.tools[1].name).toBe(shortAlias('write_file'))
   })
 
   test('prefixes tool_use block names in messages', () => {
@@ -165,7 +212,7 @@ describe('prefixToolNames', () => {
       ],
     }
     const result = JSON.parse(prefixToolNames(body))
-    expect(result.messages[0].content[0].name).toBe('mcp_Bash')
+    expect(result.messages[0].content[0].name).toBe(shortAlias('bash'))
     expect(result.messages[0].content[1].type).toBe('text')
   })
 
@@ -202,12 +249,12 @@ describe('prefixToolNames', () => {
 
 describe('stripToolPrefix', () => {
   test('strips mcp_ prefix from tool names', () => {
-    const text = '{"name": "mcp_read_file"}'
+    const text = `{"name": "${shortAlias('read_file')}"}`
     expect(stripToolPrefix(text)).toBe('{"name": "read_file"}')
   })
 
   test('strips multiple prefixed names', () => {
-    const text = '{"name": "mcp_tool_a"} and {"name": "mcp_tool_b"}'
+    const text = `{"name": "${shortAlias('tool_a')}"} and {"name": "${shortAlias('tool_b')}"}`
     const result = stripToolPrefix(text)
     expect(result).toContain('"name": "tool_a"')
     expect(result).toContain('"name": "tool_b"')
@@ -219,7 +266,7 @@ describe('stripToolPrefix', () => {
   })
 
   test('handles whitespace variations in JSON', () => {
-    const text = '{"name"  :  "mcp_tool"}'
+    const text = `{"name"  :  "${shortAlias('tool')}"}`
     expect(stripToolPrefix(text)).toBe('{"name": "tool"}')
   })
 })
@@ -300,8 +347,8 @@ describe('isTrustedAnthropicUrl', () => {
 describe('createStrippedStream', () => {
   test('strips tool prefixes from streamed response body', async () => {
     const chunks = [
-      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_bash"}}\n\n',
-      'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"mcp_read"}}\n\n',
+      `data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"${shortAlias('bash')}"}}\n\n`,
+      `data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"${shortAlias('read')}"}}\n\n`,
     ]
 
     const stream = new ReadableStream({
@@ -323,8 +370,8 @@ describe('createStrippedStream', () => {
     const text = await stripped.text()
     expect(text).toContain('"name":"bash"')
     expect(text).toContain('"name":"read"')
-    expect(text).not.toContain('mcp_bash')
-    expect(text).not.toContain('mcp_read')
+    expect(text).not.toContain(shortAlias('bash'))
+    expect(text).not.toContain(shortAlias('read'))
   })
 
   test('preserves response status and headers', async () => {
@@ -351,9 +398,9 @@ describe('createStrippedStream', () => {
   test('strips a tool prefix split across arbitrary stream chunks', async () => {
     const chunks = [
       'data: {"type":"content_block_start","content_block":{"type":"tool_use","na',
-      'me":"m',
-      'cp_B',
-      'ash"}}\n\n',
+      `me":"${shortAlias('bash').slice(0, 4)}`,
+      `${shortAlias('bash').slice(4, 8)}`,
+      `${shortAlias('bash').slice(8)}"}}\n\n`,
     ]
     const encoder = new TextEncoder()
     const stream = new ReadableStream({
@@ -374,8 +421,7 @@ describe('createStrippedStream', () => {
   })
 
   test('preserves unicode when every input byte is a separate chunk', async () => {
-    const input =
-      'data: {"type":"content_block_start","text":"Привет 👋","content_block":{"type":"tool_use","name":"mcp_Read"}}\n\n'
+    const input = `data: {"type":"content_block_start","text":"Привет 👋","content_block":{"type":"tool_use","name":"${shortAlias('Read')}"}}\n\n`
     const bytes = new TextEncoder().encode(input)
     const stream = new ReadableStream({
       start(controller) {
@@ -391,18 +437,21 @@ describe('createStrippedStream', () => {
     ).text()
 
     expect(text).toContain('Привет 👋')
-    expect(text).toContain('"name":"read"')
+    expect(text).toContain('"name":"Read"')
     expect(text).not.toContain('�')
   })
 
   test('drops stale content-length after rewriting the response body', () => {
-    const original = new Response('data: {"name":"mcp_Read"}\n\n', {
-      headers: {
-        'content-type': 'text/event-stream',
-        'content-length': '999',
-        'x-custom': 'value',
+    const original = new Response(
+      `data: {"name":"${shortAlias('Read')}"}\n\n`,
+      {
+        headers: {
+          'content-type': 'text/event-stream',
+          'content-length': '999',
+          'x-custom': 'value',
+        },
       },
-    })
+    )
 
     const stripped = createStrippedStream(original)
 
@@ -596,6 +645,49 @@ describe('prependClaudeCodeIdentity', () => {
     expect(result[0]?.text).toBe(CLAUDE_CODE_IDENTITY)
     expect(result[1]).toEqual({ type: 'text', text: 'some text' })
   })
+
+  test('does not emit empty text blocks after sanitization', () => {
+    const result = prependClaudeCodeIdentity([
+      '',
+      'https://github.com/anomalyco/opencode',
+      { type: 'text', text: '' },
+      {
+        type: 'text',
+        text: 'kept',
+        metadata: { source: 'test' },
+        cache_control: { type: 'ephemeral' },
+      },
+    ])
+
+    expect(result).toEqual([
+      { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      {
+        type: 'text',
+        text: 'kept',
+        metadata: { source: 'test' },
+        cache_control: { type: 'ephemeral' },
+      },
+    ])
+    expect(result.some((block) => block.text === '')).toBe(false)
+    expect(JSON.stringify(result)).not.toContain('[object Object]')
+  })
+
+  test('drops unsupported object and array system block types', () => {
+    expect(
+      prependClaudeCodeIdentity([
+        { type: 'image', source: { type: 'base64', data: 'x' } },
+        { type: 'tool_use', name: 'mcp_Read' },
+        [],
+      ]),
+    ).toEqual([{ type: 'text', text: CLAUDE_CODE_IDENTITY }])
+
+    expect(
+      prependClaudeCodeIdentity({
+        type: 'image',
+        source: { type: 'base64', data: 'x' },
+      }),
+    ).toEqual([{ type: 'text', text: CLAUDE_CODE_IDENTITY }])
+  })
 })
 
 describe('rewriteRequestBody', () => {
@@ -606,7 +698,7 @@ describe('rewriteRequestBody', () => {
       system: 'You are a helpful assistant.',
     })
     const result = JSON.parse(rewriteRequestBody(body))
-    expect(result.tools[0].name).toBe('mcp_Bash')
+    expect(result.tools[0].name).toBe(shortAlias('bash'))
     // system[0] = billing header, system[1] = identity, system[2] = rest
     expect(result.system[0].text).toContain('x-anthropic-billing-header')
     expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
@@ -694,7 +786,7 @@ describe('rewriteRequestBody', () => {
 
     // User messages are untouched
     expect(result.messages[0].content).toBe('Help me fix this bug')
-    expect(result.messages[1].content[0].name).toBe('mcp_Bash')
+    expect(result.messages[1].content[0].name).toBe(shortAlias('bash'))
   })
 
   test('handles body with no messages array', () => {
@@ -783,6 +875,139 @@ describe('rewriteRequestBody', () => {
 
     // User message is untouched
     expect(result.messages[0].content).toBe('hi')
+  })
+
+  test('omits empty and unsupported system blocks without object coercion', () => {
+    const result = JSON.parse(
+      rewriteRequestBody(
+        JSON.stringify({
+          messages: [{ role: 'user', content: 'hi' }],
+          system: [
+            '',
+            { type: 'text', text: 'https://opencode.ai/docs' },
+            { type: 'text', text: '' },
+            [],
+            { type: 'image', source: { type: 'base64', data: 'x' } },
+          ],
+        }),
+      ),
+    )
+
+    expect(result.system).toHaveLength(2)
+    expect(result.system[0].text).toContain('x-anthropic-billing-header')
+    expect(result.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(
+      result.system.every((block: { text: string }) => block.text !== ''),
+    ).toBe(true)
+    expect(JSON.stringify(result)).not.toContain('[object Object]')
+  })
+
+  test('is byte-idempotent with one identity, billing block, and prefixed tools', () => {
+    const body = JSON.stringify({
+      tools: [{ name: 'bash', type: 'function' }],
+      messages: [{ role: 'user', content: 'hello' }],
+      system: 'Useful instructions',
+    })
+
+    const aliases = new ToolNameAliasTable()
+    const once = rewriteRequestBody(body, aliases)
+    const twice = rewriteRequestBody(once, aliases)
+    const parsed = JSON.parse(twice)
+
+    expect(twice).toBe(once)
+    expect(
+      parsed.system.filter(
+        (block: { text: string }) => block.text === CLAUDE_CODE_IDENTITY,
+      ),
+    ).toHaveLength(1)
+    expect(
+      parsed.system.filter((block: { text: string }) =>
+        block.text.includes('x-anthropic-billing-header'),
+      ),
+    ).toHaveLength(1)
+    expect(parsed.tools[0].name).toBe(shortAlias('bash'))
+    aliases.dispose()
+  })
+
+  test('preserves native mixed tool names while making the rewrite idempotent', () => {
+    const body = JSON.stringify({
+      tools: [{ name: 'mcp_Bash' }, { name: 'bash' }],
+      messages: [
+        { role: 'user', content: 'hello' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', name: 'mcp_Bash', id: 'native-1' },
+            { type: 'tool_use', name: 'bash', id: 'native-2' },
+          ],
+        },
+      ],
+    })
+
+    const aliases = new ToolNameAliasTable()
+    const once = JSON.parse(rewriteRequestBody(body, aliases))
+    const twiceText = rewriteRequestBody(JSON.stringify(once), aliases)
+
+    expect(once.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      shortAlias('mcp_Bash'),
+      shortAlias('bash'),
+    ])
+    expect(
+      once.messages[1].content.map((block: { name: string }) => block.name),
+    ).toEqual([shortAlias('mcp_Bash'), shortAlias('bash')])
+    expect(
+      JSON.parse(stripToolPrefix(JSON.stringify(once), aliases)).tools.map(
+        (tool: { name: string }) => tool.name,
+      ),
+    ).toEqual(['mcp_Bash', 'bash'])
+    expect(twiceText).toBe(JSON.stringify(once))
+    aliases.dispose()
+  })
+
+  test('normalizes rewritten-looking system blocks and already-prefixed tools', () => {
+    const body = JSON.stringify({
+      tools: [{ name: 'mcp_Bash' }],
+      messages: [{ role: 'user', content: 'hello' }],
+      system: [
+        { type: 'text', text: CLAUDE_CODE_IDENTITY },
+        { type: 'text', text: 'x-anthropic-billing-header: stale' },
+        { type: 'text', text: 'Meaningful instructions' },
+        { type: 'text', text: 'x-anthropic-billing-header: duplicate' },
+        { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      ],
+    })
+
+    const aliases = new ToolNameAliasTable()
+    const onceText = rewriteRequestBody(body, aliases)
+    const once = JSON.parse(onceText)
+    const twiceText = rewriteRequestBody(onceText, aliases)
+
+    expect(once.system).toHaveLength(3)
+    expect(once.system[0].text).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.258.59d; cc_entrypoint=sdk-cli; cch=2cf24;',
+    )
+    expect(once.system[1].text).toBe(CLAUDE_CODE_IDENTITY)
+    expect(once.system[2].text).toBe('Meaningful instructions')
+    expect(once.tools[0].name).toBe('mcp_Bash')
+    expect(JSON.parse(stripToolPrefix(onceText, aliases)).tools[0].name).toBe(
+      'mcp_Bash',
+    )
+    expect(twiceText).toBe(onceText)
+    aliases.dispose()
+  })
+
+  test('is byte-idempotent when there are no users or tools', () => {
+    const body = JSON.stringify({ system: 'Only instructions', messages: [] })
+    const once = rewriteRequestBody(body)
+    const twice = rewriteRequestBody(once)
+
+    expect(twice).toBe(once)
+    expect(JSON.parse(twice).system).toEqual([
+      { type: 'text', text: CLAUDE_CODE_IDENTITY },
+      { type: 'text', text: 'Only instructions' },
+    ])
+    expect(twice).not.toContain('x-anthropic-billing-header')
+    expect(twice).not.toContain('mcp_')
   })
 })
 
