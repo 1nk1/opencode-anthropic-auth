@@ -1281,7 +1281,7 @@ describe('reported Claude Code version', () => {
   })
 
   test('warns but still reports an override older than the bundled version', async () => {
-    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '2.1.279'
+    process.env[ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR] = '2.1.283'
     const client = createMockClient()
 
     const { userAgent, billingHeader } = await captureReportedVersion(client)
@@ -1293,8 +1293,8 @@ describe('reported Claude Code version', () => {
 
     // Warning it is not the same as ignoring it: the explicit override still
     // reaches both reported places.
-    expect(userAgent).toBe('claude-cli/2.1.279 (external, cli)')
-    expect(billingHeader).toContain('cc_version=2.1.279.')
+    expect(userAgent).toBe('claude-cli/2.1.283 (external, cli)')
+    expect(billingHeader).toContain('cc_version=2.1.283.')
   })
 
   test('stays silent for an override at or above the bundled version', async () => {
